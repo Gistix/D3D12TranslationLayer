@@ -43,7 +43,7 @@ private:
 #define DECLARE_COMMAND_VALUE static constexpr UINT CmdValue = (__COUNTER__ - c_FirstCommandCounterValue);
 
 public:
-    static constexpr size_t BatchSizeInBytes = 2048;
+    static constexpr size_t BatchSizeInBytes = 16384;
     struct BatchStorageAllocator
     {
         FreePageContainer* m_Container;

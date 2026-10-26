@@ -1013,6 +1013,12 @@ namespace D3D12TranslationLayer
     //----------------------------------------------------------------------------------------------------------------------------------
     void ResourceStateManager::TransitionResourceForBindings(Resource* pResource) noexcept
     {
+        if (pResource->GetIdentity() &&
+            !pResource->GetIdentity()->m_bOwnsUnderlyingResource &&
+            pResource->GetAllocatorHeapType() == AllocatorHeapType::Upload)
+        {
+            return;
+        }
         auto& Bindings = pResource->GetBindingState();
         if (Bindings.AreAllSubresourcesTheSame())
         {
@@ -1030,6 +1036,12 @@ namespace D3D12TranslationLayer
     //----------------------------------------------------------------------------------------------------------------------------------
     void ResourceStateManager::TransitionSubresourcesForBindings(Resource* pResource, CViewSubresourceSubset const & Subresources) noexcept
     {
+        if (pResource->GetIdentity() &&
+            !pResource->GetIdentity()->m_bOwnsUnderlyingResource &&
+            pResource->GetAllocatorHeapType() == AllocatorHeapType::Upload)
+        {
+            return;
+        }
         auto& Bindings = pResource->GetBindingState();
         if (Bindings.AreAllSubresourcesTheSame())
         {

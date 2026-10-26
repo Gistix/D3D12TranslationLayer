@@ -4096,18 +4096,18 @@ D3D12ResourceSuballocation ImmediateContext::AcquireSuballocatedHeap(AllocatorHe
 
     auto &allocator = GetAllocator(HeapType);
     
-    HeapSuballocationBlock suballocation =
+    auto allocPair =
         TryAllocateResourceWithFallback([&]()
     {
-        auto block = allocator.Allocate(Size, bCannotBeOffset);
-        if (block.GetSize() == 0)
+        auto pair = allocator.AllocateWithInner(Size, bCannotBeOffset);
+        if (pair.first.GetSize() == 0)
         {
             throw _com_error(E_OUTOFMEMORY);
         }
-        return block;
+        return pair;
     }, threadingContext);
 
-    D3D12ResourceSuballocation ret(allocator.GetInnerAllocation(suballocation), suballocation);
+    D3D12ResourceSuballocation ret(allocPair.second, allocPair.first);
     PopulateCachedSuballocationMappings(HeapType, ret);
     return ret;
 }
@@ -5475,7 +5475,7 @@ void TRANSLATION_API ImmediateContext::RotateResourceIdentities(Resource* const*
         for (UINT stage = 0; stage < ShaderStageCount; ++stage)
         {
             auto& stageState = m_CurrentState.GetStageState((EShaderStage)stage);
-        if (false)
+        if (false && stage == 99)
         {
             stageState.m_CBs.SetDirtyBits(bindingState.m_ConstantBufferBindings[stage]);
         }
@@ -5498,7 +5498,11 @@ void TRANSLATION_API ImmediateContext::RotateResourceIdentities(Resource* const*
             bindingState.IsBoundAsDepthStencil() ||
             bindingState.IsBoundAsStreamOut())
         {
-            m_ResourceStateManager.TransitionResourceForBindings(pLastResource);
+            if (pLastResource->m_Identity &&
+                pLastResource->m_Identity->m_bOwnsUnderlyingResource)
+            {
+                m_ResourceStateManager.TransitionResourceForBindings(pLastResource);
+            }
         }
 
         if (i < Resources)

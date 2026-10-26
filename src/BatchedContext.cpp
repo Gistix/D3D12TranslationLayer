@@ -400,6 +400,7 @@ template <> struct CommandDispatcher<BatchedContext::CmdRename::CmdValue>
     {
         auto& Data = GetCommandData<BatchedContext::CmdRename>(pCommandData);
         ImmCtx.Rename(Data.pResource, Data.pRenameResource);
+        ImmCtx.DeleteRenameCookie(Data.pRenameResource);
     }
 };
 template <> struct CommandDispatcher<BatchedContext::CmdRenameViaCopy::CmdValue>
@@ -408,6 +409,7 @@ template <> struct CommandDispatcher<BatchedContext::CmdRenameViaCopy::CmdValue>
     {
         auto& Data = GetCommandData<BatchedContext::CmdRenameViaCopy>(pCommandData);
         ImmCtx.RenameViaCopy(Data.pResource, Data.pRenameResource, Data.dirtyPlaneMask);
+        ImmCtx.DeleteRenameCookie(Data.pRenameResource);
     }
 };
 template <> struct CommandDispatcher<BatchedContext::CmdQueryBegin::CmdValue>
@@ -1173,7 +1175,8 @@ bool TRANSLATION_API BatchedContext::RenameAndMapBuffer(BatchedResource* pResour
         void* pData = nullptr;
     
         ThrowFailure(pResource->m_LastRenamedResource.Map(0, &ReadRange, &pData));
-        AddToBatch(CmdRename{ pResource->m_pResource, cookie.Get() });
+        AddToBatch(CmdRename{ pResource->m_pResource, cookie.Detach() });
+        if (false)
         AddPostBatchFunction([cleanup = cookie.Detach(), &immCtx = GetImmediateContextNoFlush()](){ immCtx.DeleteRenameCookie(cleanup); });
     
         pMappedSubresource->pData = pData;
@@ -1300,7 +1303,8 @@ void TRANSLATION_API BatchedContext::UnmapRenamedBuffer(BatchedResource* pResour
                 suballoc.Unmap(0, &WriteRange);
             }
             pResource->m_LastRenamedResource = suballoc;
-            AddToBatch(CmdRename{ pResource->m_pResource, cookie.Get() });
+            AddToBatch(CmdRename{ pResource->m_pResource, cookie.Detach() });
+        if (false)
             AddPostBatchFunction([cleanup = cookie.Detach(), &immCtx = GetImmediateContextNoFlush()]() { immCtx.DeleteRenameCookie(cleanup); });
         }
         catch (_com_error& hrEx)
@@ -1365,7 +1369,8 @@ void TRANSLATION_API BatchedContext::UnmapAndRenameViaCopy(BatchedResource* pRes
 
         pResource->m_LastRenamedResource.Unmap(0, &WriteRange);
 
-        AddToBatch(CmdRenameViaCopy{ pResource->m_pResource, pResource->m_PendingRenameViaCopyCookie.Get(), pResource->m_DynamicTexturePlaneData.m_DirtyPlaneMask });
+        AddToBatch(CmdRenameViaCopy{ pResource->m_pResource, pResource->m_PendingRenameViaCopyCookie.Detach(), pResource->m_DynamicTexturePlaneData.m_DirtyPlaneMask });
+        if (false)
         AddPostBatchFunction([cleanup = pResource->m_PendingRenameViaCopyCookie.Detach(), &immCtx = GetImmediateContextNoFlush()](){ immCtx.DeleteRenameCookie(cleanup); });
 
         pResource->m_DynamicTexturePlaneData = {};

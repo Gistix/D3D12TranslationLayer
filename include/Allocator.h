@@ -50,6 +50,11 @@ namespace D3D12TranslationLayer
             _BlockType block(0, size, m_InnerAllocator.Allocate(size));
             return block;
         }
+        auto AllocateWithInner(_SizeType size)
+        {
+            auto block = Allocate(size);
+            return std::make_pair(block, block.GetDirectHeapAllocation());
+        }
         void Deallocate(const _BlockType &block) { m_InnerAllocator.Deallocate(block.GetDirectHeapAllocation()); }
 
         typedef typename std::invoke_result<decltype(&InnerAllocatorDecayed::Allocate), InnerAllocatorDecayed, _SizeType>::type AllocationType;
@@ -80,6 +85,18 @@ namespace D3D12TranslationLayer
         {
             auto scopedLock = m_Lock.TakeLock();
             return DisjointBuddyHeapAllocator::Allocate(size);
+        }
+        auto AllocateWithInner(UINT64 size)
+        {
+            auto scopedLock = m_Lock.TakeLock();
+            auto block = DisjointBuddyHeapAllocator::Allocate(size);
+            using InnerAlloc = decltype(DisjointBuddyHeapAllocator::GetInnerAllocation(block));
+            InnerAlloc inner{};
+            if (block.GetSize() != 0)
+            {
+                inner = DisjointBuddyHeapAllocator::GetInnerAllocation(block);
+            }
+            return std::make_pair(block, inner);
         }
 
         void Deallocate(const HeapSuballocationBlock &block)
@@ -123,6 +140,11 @@ namespace D3D12TranslationLayer
         {
             if (m_pfnUseDirectHeapAllocator(size, args)) { return m_DirectAllocator.Allocate(size); }
             else { return m_SuballocationAllocator.Allocate(size); }
+        }
+        auto AllocateWithInner(_SizeType size, AllocationArgs args)
+        {
+            if (m_pfnUseDirectHeapAllocator(size, args)) { return m_DirectAllocator.AllocateWithInner(size); }
+            else { return m_SuballocationAllocator.AllocateWithInner(size); }
         }
 
         void Deallocate(const _BlockType &block)
