@@ -893,8 +893,35 @@ inline void ImmediateContext::DirtyConstantBuffersHelper(UINT& HeapSlot) noexcep
         UINT APISize = CurrentState.m_uConstantBufferCounts[i] * 16;
         GetBufferViewDesc(pBuffer, CBDesc, APIOffset, APISize);
 
+        if (!m_bCBStagingInitialized[eShader][i] ||
+            CBDesc.BufferLocation != m_CachedCBVDescs[eShader][i].BufferLocation ||
+            CBDesc.SizeInBytes != m_CachedCBVDescs[eShader][i].SizeInBytes)
+        {
+            m_pDevice12->CreateConstantBufferView(&CBDesc, m_CBStagingCpuHandles[eShader][i]);
+            m_CachedCBVDescs[eShader][i] = CBDesc;
+            m_bCBStagingInitialized[eShader][i] = true;
+        }
+        /* if (false)
+        {
+        CBBindings.ResetDirty(i);
+        auto pBuffer = CBBindings.GetBound()[i];
+        D3D12_CONSTANT_BUFFER_VIEW_DESC CBDesc;
+        UINT APIOffset = CurrentState.m_uConstantBufferOffsets[i] * 16;
+        UINT APISize = CurrentState.m_uConstantBufferCounts[i] * 16;
+        GetBufferViewDesc(pBuffer, CBDesc, APIOffset, APISize);
+
         D3D12_CPU_DESCRIPTOR_HANDLE Descriptor = m_ViewHeap.CPUHandle(HeapSlot + i);
         m_pDevice12->CreateConstantBufferView(&CBDesc, Descriptor);
+        } */
+    }
+
+    if (numCBs > 0)
+    {
+        m_pDevice12->CopyDescriptorsSimple(
+            numCBs,
+            m_ViewHeap.CPUHandle(HeapSlot),
+            m_CBStagingCpuHandles[eShader][0],
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
 
     CurrentState.m_CBTableBase = m_ViewHeap.GPUHandle(HeapSlot);
@@ -943,7 +970,7 @@ inline void GetBufferViewDesc(Resource* pBuffer, TDesc& Desc, UINT APIOffset, UI
             min(GetDynamicBufferSize<TDesc>(pBuffer, APIOffset), APISize);
         Desc.BufferLocation = Desc.SizeInBytes == 0 ? 0 :
             // TODO: Cache the GPU VA, frequent calls to this cause a CPU hotspot
-            (pBuffer->GetUnderlyingResource()->GetGPUVirtualAddress() // Base of the DX12 resource
+            (pBuffer->GetUnderlyingGpuVA() // Base of the DX12 resource
                 + pBuffer->GetSubresourcePlacement(0).Offset // Base of the DX11 resource after renaming
                 + APIOffset); // Offset from the base of the DX11 resource
     }

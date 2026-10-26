@@ -613,6 +613,14 @@ template <> struct CommandDispatcher<BatchedContext::CmdEndEvent::CmdValue>
         ImmCtx.EndEvent();
     }
 };
+template <> struct CommandDispatcher<BatchedContext::CmdRenameSuballocation::CmdValue>
+{
+    static void Execute(ImmediateContext& ImmCtx, const void*& pCommandData)
+    {
+        auto& Data = GetCommandData<BatchedContext::CmdRenameSuballocation>(pCommandData);
+        ImmCtx.RenameSuballocation(Data.pResource, Data.NewSuballocation);
+    }
+};
 
 //----------------------------------------------------------------------------------------------------------------------------------
 // These structs generate an array consisting of the functions defined above,
@@ -661,7 +669,7 @@ BatchedContext::BatchedContext(ImmediateContext& ImmCtx, CreationArgs args, Call
         {
             reinterpret_cast<BatchedContext*>(pContext)->BatchThread();
             return 0;
-        }, this, CREATE_SUSPENDED, nullptr);
+        }, this, CREATE_SUSPENDED, &m_BatchThreadId);
         ThrowIfHandleNull(m_BatchThread);
         ResumeThread(m_BatchThread.m_h);
     }
@@ -1148,6 +1156,14 @@ bool TRANSLATION_API BatchedContext::RenameAndMapBuffer(BatchedResource* pResour
     try
     {
         auto& ImmCtx = GetImmediateContextNoFlush();
+        if (pResource->m_pCBWriteScratch != nullptr)
+        {
+            pResource->m_bFastCBMapActive = true;
+            pMappedSubresource->pData = pResource->m_pCBWriteScratch;
+            pMappedSubresource->RowPitch = pResource->m_CBAlignedSize;
+            pMappedSubresource->DepthPitch = pResource->m_CBAlignedSize;
+            return true;
+        }
         SafeRenameResourceCookie cookie(ImmCtx.CreateRenameCookie(pResource->m_pResource, ResourceAllocationContext::FreeThread));
     
         Resource* pRenameResource = cookie.Get();
@@ -1231,6 +1247,14 @@ bool TRANSLATION_API BatchedContext::MapRenamedBuffer(BatchedResource* pResource
     D3D12_RANGE ReadRange = CD3DX12_RANGE(0, 0);
     void* pData = nullptr;
 
+    if (pResource->m_pCBWriteScratch != nullptr)
+    {
+        pResource->m_bFastCBMapActive = true;
+        pMappedSubresource->pData = pResource->m_pCBWriteScratch;
+        pMappedSubresource->RowPitch = pResource->m_CBAlignedSize;
+        pMappedSubresource->DepthPitch = pResource->m_CBAlignedSize;
+        return true;
+    }
     ThrowFailure(pResource->m_LastRenamedResource.Map(0, &ReadRange, &pData));
 
     pMappedSubresource->pData = pData;
@@ -1244,6 +1268,64 @@ bool TRANSLATION_API BatchedContext::MapRenamedBuffer(BatchedResource* pResource
 // Just unmap the renamed buffer.
 void TRANSLATION_API BatchedContext::UnmapRenamedBuffer(BatchedResource* pResource, _In_opt_ const D3D12_BOX *pReadWriteRange)
 {
+    if (pResource->m_bFastCBMapActive)
+    {
+        pResource->m_bFastCBMapActive = false;
+        if (pResource->m_bHasCommittedCBData &&
+            memcmp(pResource->m_pCBWriteScratch, pResource->m_pCBLastCommitted, pResource->m_CBWidth) == 0)
+        {
+            return;
+        }
+        memcpy(pResource->m_pCBLastCommitted, pResource->m_pCBWriteScratch, pResource->m_CBWidth);
+        pResource->m_bHasCommittedCBData = true;
+
+        try
+        {
+            auto& ImmCtx = GetImmediateContextNoFlush();
+            SafeRenameResourceCookie cookie(ImmCtx.CreateRenameCookie(pResource->m_pResource, ResourceAllocationContext::FreeThread));
+            Resource* pRenameResource = cookie.Get();
+            D3D12ResourceSuballocation suballoc = pRenameResource->GetIdentity()->m_suballocation;
+            BYTE* pDst = suballoc.GetMappedCpuPtr();
+            if (pDst)
+            {
+                memcpy(pDst, pResource->m_pCBWriteScratch, pResource->m_CBWidth);
+            }
+            else
+            {
+                D3D12_RANGE ReadRange = CD3DX12_RANGE(0, 0);
+                void* pData = nullptr;
+                ThrowFailure(suballoc.Map(0, &ReadRange, &pData));
+                memcpy(pData, pResource->m_pCBWriteScratch, pResource->m_CBWidth);
+                D3D12_RANGE WriteRange = CD3DX12_RANGE(0, pResource->m_CBAlignedSize);
+                suballoc.Unmap(0, &WriteRange);
+            }
+            pResource->m_LastRenamedResource = suballoc;
+            AddToBatch(CmdRename{ pResource->m_pResource, cookie.Get() });
+            AddPostBatchFunction([cleanup = cookie.Detach(), &immCtx = GetImmediateContextNoFlush()]() { immCtx.DeleteRenameCookie(cleanup); });
+        }
+        catch (_com_error& hrEx)
+        {
+            if (hrEx.Error() == E_OUTOFMEMORY)
+            {
+                MappedSubresource mapped = {};
+                (void)FlushBatchAndGetImmediateContext().MapDiscardBuffer(pResource->m_pResource, 0, MAP_TYPE_WRITE_DISCARD, false, nullptr, &mapped);
+                if (mapped.pData)
+                {
+                    memcpy(mapped.pData, pResource->m_pCBWriteScratch, pResource->m_CBWidth);
+                    if (pResource->m_CBAlignedSize > pResource->m_CBWidth)
+                    {
+                        memset(static_cast<BYTE*>(mapped.pData) + pResource->m_CBWidth, 0, pResource->m_CBAlignedSize - pResource->m_CBWidth);
+                    }
+                }
+                GetImmediateContextNoFlush().UnmapUnderlyingSimple(pResource->m_pResource, 0, nullptr);
+                pResource->m_LastRenamedResource = pResource->m_pResource->GetIdentity()->m_suballocation;
+                return;
+            }
+            throw;
+        }
+        return;
+    }
+
     D3D12_RANGE WriteRange =
         pReadWriteRange
         ? CD3DX12_RANGE(pReadWriteRange->left, pReadWriteRange->right)
@@ -1920,7 +2002,7 @@ bool BatchedContext::WaitForBatchThreadIdle()
 bool BatchedContext::IsBatchThreadIdle()
 {
     assert(!IsBatchThread());
-    while (m_NumOutstandingBatches > 0 && WaitForSingleBatch(0));
+    while (m_NumOutstandingBatches > 0 && m_AtomicCompletedBatches.load(std::memory_order_acquire) > 0 && WaitForSingleBatch(0));
     return m_NumOutstandingBatches == 0;
 }
 
@@ -1930,6 +2012,7 @@ bool BatchedContext::WaitForSingleBatch(DWORD timeout)
     assert(!IsBatchThread());
     if (WaitForSingleObject(m_BatchConsumedSemaphore, timeout) == WAIT_OBJECT_0)
     {
+        --m_AtomicCompletedBatches;
         --m_NumOutstandingBatches;
         if (m_bFlushPendingCallback.exchange(false))
         {
@@ -2005,6 +2088,7 @@ void BatchedContext::BatchThread()
             m_ImmCtx.Flush(FlushRequestedMask);
         }
 
+        ++m_AtomicCompletedBatches;
         BOOL value = ReleaseSemaphore(m_BatchConsumedSemaphore, 1, nullptr);
         assert(value == TRUE);
         UNREFERENCED_PARAMETER(value);
@@ -2015,7 +2099,7 @@ void BatchedContext::BatchThread()
 bool BatchedContext::IsBatchThread()
 {
     return m_CreationArgs.SubmitBatchesToWorkerThread &&
-        GetCurrentThreadId() == GetThreadId(m_BatchThread.m_h);
+        GetCurrentThreadId() == m_BatchThreadId;
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------

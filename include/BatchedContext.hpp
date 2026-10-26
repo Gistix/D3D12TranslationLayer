@@ -506,6 +506,14 @@ public:
     };
 
     // The 0-based value of the last command.
+    struct CmdRenameSuballocation
+    {
+        DECLARE_COMMAND_VALUE;
+        Resource* pResource;
+        EncodedResourceSuballocation NewSuballocation;
+    };
+
+    // The 0-based value of the last command.
     static constexpr UINT c_LastCommand = __COUNTER__ - c_FirstCommandCounterValue - 1;
 
     struct CreationArgs
@@ -761,6 +769,8 @@ private: // Referenced by recording and batch threads
 
     const Callbacks m_Callbacks;
     std::atomic<bool> m_bFlushPendingCallback;
+    std::atomic<UINT> m_AtomicCompletedBatches{ 0 };
+    DWORD m_BatchThreadId = 0;
 
 private: // Referenced by recording thread
     CBoundState<UAV, D3D11_1_UAV_SLOT_COUNT> m_UAVs;
@@ -777,7 +787,7 @@ private: // Referenced by recording thread
             (m_CreationArgs.SubmitBatchesToWorkerThread ? &m_FreePages : nullptr)
     };
 
-    static constexpr UINT c_CommandKickoffMinThreshold = 10; // Arbitrary for now
+    static constexpr UINT c_CommandKickoffMinThreshold = 256; // Avoid micro-batching and kernel wait syscalls every 10 commands
     OptLock<std::recursive_mutex> m_RecordingLock{ m_CreationArgs.CreatesAndDestroysAreMultithreaded };
     UINT m_CurrentCommandCount = 0;
     UINT m_NumOutstandingBatches = 0;

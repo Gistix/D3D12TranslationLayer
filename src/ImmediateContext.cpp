@@ -199,6 +199,24 @@ ImmediateContext::ImmediateContext(UINT nodeIndex, D3D12_FEATURE_DATA_D3D12_OPTI
     m_ViewHeap.m_DescriptorHeapBaseCPU = m_ViewHeap.m_pDescriptorHeap->GetCPUDescriptorHandleForHeapStart().ptr;
     m_ViewHeap.m_BitsToSetOnNewHeap = e_ViewsDirty;
 
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC cbStagingDesc = {};
+        cbStagingDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        cbStagingDesc.NumDescriptors = ShaderStageCount * D3D11_COMMONSHADER_CONSTANT_BUFFER_HW_SLOT_COUNT;
+        cbStagingDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        cbStagingDesc.NodeMask = GetNodeMask();
+        ThrowFailure(m_pDevice12->CreateDescriptorHeap(&cbStagingDesc, IID_PPV_ARGS(&m_spCBStagingCpuHeap)));
+        auto cpuBase = m_spCBStagingCpuHeap->GetCPUDescriptorHandleForHeapStart();
+        for (UINT stage = 0; stage < ShaderStageCount; ++stage)
+        {
+            for (UINT slot = 0; slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_HW_SLOT_COUNT; ++slot)
+            {
+                UINT idx = stage * D3D11_COMMONSHADER_CONSTANT_BUFFER_HW_SLOT_COUNT + slot;
+                m_CBStagingCpuHandles[stage][slot].ptr = cpuBase.ptr + idx * m_ViewHeap.m_DescriptorSize;
+            }
+        }
+    }
+
     if (!ComputeOnly())
     {
         hr = m_pDevice12->CreateDescriptorHeap(&m_SamplerHeap.m_Desc, IID_PPV_ARGS(&m_SamplerHeap.m_pDescriptorHeap));
@@ -537,7 +555,10 @@ void TRANSLATION_API ImmediateContext::PostSubmitNotification()
         m_callbacks.m_pfnPostSubmit();
     }
     TrimDeletedObjects();
-    TrimResourcePools();
+    if ((GetCommandListID(COMMAND_LIST_TYPE::GRAPHICS) & 63) == 0)
+    {
+        TrimResourcePools();
+    }
 
     const UINT64 completedFence = GetCompletedFenceValue(COMMAND_LIST_TYPE::GRAPHICS);
 
@@ -4086,7 +4107,31 @@ D3D12ResourceSuballocation ImmediateContext::AcquireSuballocatedHeap(AllocatorHe
         return block;
     }, threadingContext);
 
-    return D3D12ResourceSuballocation(allocator.GetInnerAllocation(suballocation), suballocation);
+    D3D12ResourceSuballocation ret(allocator.GetInnerAllocation(suballocation), suballocation);
+    PopulateCachedSuballocationMappings(HeapType, ret);
+    return ret;
+}
+
+void ImmediateContext::PopulateCachedSuballocationMappings(AllocatorHeapType HeapType, D3D12ResourceSuballocation& suballoc) noexcept
+{
+    ID3D12Resource* pRes = suballoc.GetResource();
+    if (!pRes)
+    {
+        return;
+    }
+    CD3DX12_RANGE NullRange(0, 0);
+    void* pData = nullptr;
+    if (SUCCEEDED(pRes->Map(0, &NullRange, &pData)))
+    {
+        pRes->Unmap(0, &NullRange);
+        D3D12_GPU_VIRTUAL_ADDRESS gpuVA = (HeapType == AllocatorHeapType::Upload || HeapType == AllocatorHeapType::Decoder)
+            ? pRes->GetGPUVirtualAddress() : 0;
+        suballoc.SetCachedMappings(static_cast<BYTE*>(pData), gpuVA);
+    }
+    if (false)
+    {
+        (void)pData;
+    }
 }
 
 inline bool IsSyncPointLessThanOrEqual(UINT64(&lhs)[(UINT)COMMAND_LIST_TYPE::MAX_VALID],
@@ -4258,6 +4303,40 @@ Resource* TRANSLATION_API ImmediateContext::CreateRenameCookie(Resource* pResour
 {
     assert(pResource->GetEffectiveUsage() == RESOURCE_USAGE_DYNAMIC);
 
+    if (pResource->NumSubresources() == 1 &&
+        pResource->Parent()->ResourceDimension12() == D3D12_RESOURCE_DIMENSION_BUFFER &&
+        pResource->GetAllocatorHeapType() == AllocatorHeapType::Upload &&
+        !pResource->IsDecoderCompressedBuffer() &&
+        !pResource->IsLockableSharedBuffer() &&
+        pResource->GetFormatEmulation() == FormatEmulation::None &&
+        (pResource->Parent()->m_flags11.MiscFlags & D3D11_RESOURCE_MISC_TILED) == 0)
+    {
+        unique_comptr<Resource> recycledCookie;
+        {
+            auto LockedContainer = m_RenamesInFlight.GetLocked();
+            if (!LockedContainer->empty())
+            {
+                recycledCookie = std::move(LockedContainer->back());
+                LockedContainer->pop_back();
+            }
+        }
+        if (recycledCookie)
+        {
+            recycledCookie->m_creationArgs.m_desc12 = pResource->m_creationArgs.m_desc12;
+            recycledCookie->m_creationArgs.m_appDesc = pResource->m_creationArgs.m_appDesc;
+            recycledCookie->m_creationArgs.m_appDesc.m_usage = RESOURCE_USAGE_STAGING;
+            recycledCookie->m_creationArgs.m_appDesc.m_bindFlags &= ~(RESOURCE_BIND_DECODER | RESOURCE_BIND_VIDEO_ENCODER | RESOURCE_BIND_CAPTURE);
+            recycledCookie->m_creationArgs.m_flags11 = pResource->m_creationArgs.m_flags11;
+            recycledCookie->m_creationArgs.m_flags11.BindFlags &= ~(D3D11_BIND_DECODER | D3D11_BIND_VIDEO_ENCODER);
+            recycledCookie->m_creationArgs.m_heapType = AllocatorHeapType::Upload;
+            recycledCookie->InitializeSubresourceDescs();
+            recycledCookie->m_Identity->m_suballocation = AcquireSuballocatedHeapForResource(recycledCookie.get(), threadingContext);
+            recycledCookie->m_SubresourcePlacement[0].Offset = recycledCookie->m_Identity->GetSuballocatedOffset();
+            recycledCookie->UnderlyingResourceChanged();
+            recycledCookie->ZeroConstantBufferPadding();
+            return recycledCookie.release();
+        }
+    }
     auto creationArgsCopy = pResource->m_creationArgs;
     creationArgsCopy.m_appDesc.m_usage = RESOURCE_USAGE_STAGING; // Make sure it's suballocated
     creationArgsCopy.m_heapDesc.Properties = CD3DX12_HEAP_PROPERTIES(Resource::GetD3D12HeapType(RESOURCE_USAGE_STAGING, creationArgsCopy.m_appDesc.CPUAccessFlags()), GetNodeMask(), GetNodeMask());
@@ -4278,8 +4357,8 @@ Resource* TRANSLATION_API ImmediateContext::CreateRenameCookie(Resource* pResour
 
     assert(renameResource->GetAllocatorHeapType() == pResource->GetAllocatorHeapType());
 
-    m_RenamesInFlight.GetLocked()->emplace_back(renameResource.get());
-    return renameResource.get();
+    return renameResource.release();
+    // Handled above via release()
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------
@@ -4289,6 +4368,26 @@ void TRANSLATION_API ImmediateContext::Rename(Resource* pResource, Resource* pRe
 
     Resource* rotate[2] = { pResource, renameResource.get() };
     RotateResourceIdentities(rotate, 2);
+}
+
+//----------------------------------------------------------------------------------------------------------------------------------
+void TRANSLATION_API ImmediateContext::RenameSuballocation(Resource* pResource, EncodedResourceSuballocation const& NewSuballocation)
+{
+    COMMAND_LIST_TYPE CmdListType = pResource->GetAllocatorHeapType() == AllocatorHeapType::Decoder ?
+        COMMAND_LIST_TYPE::VIDEO_DECODE : COMMAND_LIST_TYPE::GRAPHICS;
+
+    const UINT64 curCmdListID = GetCommandListID(CmdListType);
+    pResource->UsedInCommandList(CmdListType, curCmdListID);
+    ReturnAllBuffersToPool(*pResource);
+
+    D3D12ResourceSuballocation suballoc = NewSuballocation.Decode();
+    PopulateCachedSuballocationMappings(pResource->GetAllocatorHeapType(), suballoc);
+    pResource->m_Identity->m_suballocation = suballoc;
+    pResource->m_SubresourcePlacement[0].Offset = suballoc.GetOffset();
+
+
+    pResource->UnderlyingResourceChanged();
+    RotateResourceIdentities(&pResource, 1);
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------
@@ -4324,10 +4423,10 @@ void TRANSLATION_API ImmediateContext::RenameViaCopy(Resource* pResource, Resour
 //----------------------------------------------------------------------------------------------------------------------------------
 void TRANSLATION_API ImmediateContext::DeleteRenameCookie(Resource* pRenameResource)
 {
-    auto LockedContainer = m_RenamesInFlight.GetLocked();
+    if (false) { auto LockedContainer = m_RenamesInFlight.GetLocked();
     auto iter = std::find_if(LockedContainer->begin(), LockedContainer->end(),
                              [pRenameResource](unique_comptr<Resource> const& r) { return r.get() == pRenameResource; });
-    assert(iter != LockedContainer->end());
+    assert(iter != LockedContainer->end()); }
 
     // The only scenario where video is relevant here is for decode bitstream buffers. All other instances of
     // resource renaming are Map(DISCARD) graphics operations.
@@ -4335,7 +4434,23 @@ void TRANSLATION_API ImmediateContext::DeleteRenameCookie(Resource* pRenameResou
         COMMAND_LIST_TYPE::VIDEO_DECODE : COMMAND_LIST_TYPE::GRAPHICS;
 
     pRenameResource->UsedInCommandList(CmdListType, GetCommandListID(CmdListType));
-    LockedContainer->erase(iter);
+    if (pRenameResource->NumSubresources() == 1 &&
+        pRenameResource->Parent()->ResourceDimension12() == D3D12_RESOURCE_DIMENSION_BUFFER &&
+        pRenameResource->m_Identity &&
+        !pRenameResource->m_Identity->m_bOwnsUnderlyingResource &&
+        pRenameResource->GetAllocatorHeapType() == AllocatorHeapType::Upload &&
+        !pRenameResource->IsDecoderCompressedBuffer() &&
+        !pRenameResource->IsTransitionPending())
+    {
+        ReturnAllBuffersToPool(*pRenameResource);
+        auto LockedContainer = m_RenamesInFlight.GetLocked();
+        if (LockedContainer->size() < 2048)
+        {
+            LockedContainer->emplace_back(pRenameResource);
+            return;
+        }
+    }
+    pRenameResource->Release();
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------
@@ -4518,6 +4633,15 @@ bool TRANSLATION_API ImmediateContext::MapUnderlying(Resource* pResource, UINT S
 
     // Write-only means read range can be empty
     D3D12_RANGE MappedRange = pResource->GetSubresourceRange(Subresource, pReadWriteRange);
+    if (!pResource->m_Identity->m_bOwnsUnderlyingResource && pResource->m_Identity->m_suballocation.GetMappedCpuPtr() != nullptr && Subresource == 0 && pReadWriteRange == nullptr)
+    {
+        auto& SubresourceInfo = pResource->GetSubresourcePlacement(0);
+        pMap->pData = pResource->m_Identity->m_suballocation.GetMappedCpuPtr();
+        pMap->RowPitch = SubresourceInfo.Footprint.RowPitch;
+        pMap->DepthPitch = pResource->DepthPitch(0);
+        return true;
+    }
+
     D3D12_RANGE ReadRange =
         MapType == MAP_TYPE_WRITE ? CD3DX12_RANGE(0, 0) : MappedRange;
     HRESULT hr = pResource12->Map(0, &ReadRange, &pData);
@@ -4702,6 +4826,15 @@ bool TRANSLATION_API ImmediateContext::MapDefault(Resource* pResource, UINT Subr
     // Write-only means read range can be empty
     bool bWriteOnly = (MapType == MAP_TYPE_WRITE || MapType == MAP_TYPE_WRITE_NOOVERWRITE);
     D3D12_RANGE MappedRange = pResource->GetSubresourceRange(Subresource, pReadWriteRange);
+    if (!pResource->m_Identity->m_bOwnsUnderlyingResource && pResource->m_Identity->m_suballocation.GetMappedCpuPtr() != nullptr && Subresource == 0 && pReadWriteRange == nullptr)
+    {
+        auto& SubresourceInfo = pResource->GetSubresourcePlacement(0);
+        pMap->pData = pResource->m_Identity->m_suballocation.GetMappedCpuPtr();
+        pMap->RowPitch = SubresourceInfo.Footprint.RowPitch;
+        pMap->DepthPitch = pResource->DepthPitch(0);
+        return true;
+    }
+
     D3D12_RANGE ReadRange = bWriteOnly ? CD3DX12_RANGE(0, 0) : MappedRange;
     // If we know we are not reading, pass an empty range, otherwise pass a null (full) range
     D3D12_RANGE* pNonStandardReadRange = bWriteOnly ? &ReadRange : nullptr;
@@ -4951,6 +5084,10 @@ void TRANSLATION_API ImmediateContext::UnmapUnderlyingSimple(Resource* pResource
     assert(pResource->OwnsReadbackHeap() || pResource->UnderlyingResourceIsSuballocated());
     
     auto pResource12 = pResource->GetUnderlyingResource();
+    if (!pResource->m_Identity->m_bOwnsUnderlyingResource && pResource->m_Identity->m_suballocation.GetMappedCpuPtr() != nullptr && Subresource == 0)
+    {
+        return;
+    }
     D3D12_RANGE WrittenRange = pResource->GetSubresourceRange(Subresource, pReadWriteRange);
     pResource12->Unmap(0, &WrittenRange);
 }
@@ -5338,10 +5475,31 @@ void TRANSLATION_API ImmediateContext::RotateResourceIdentities(Resource* const*
         for (UINT stage = 0; stage < ShaderStageCount; ++stage)
         {
             auto& stageState = m_CurrentState.GetStageState((EShaderStage)stage);
+        if (false)
+        {
             stageState.m_CBs.SetDirtyBits(bindingState.m_ConstantBufferBindings[stage]);
         }
+        }
 
-        m_ResourceStateManager.TransitionResourceForBindings(pLastResource);
+        if (bindingState.IsBoundAsConstantBuffer())
+        {
+            for (UINT stage = 0; stage < ShaderStageCount; ++stage)
+            {
+                auto& stageState = m_CurrentState.GetStageState((EShaderStage)stage);
+                stageState.m_CBs.SetDirtyBits(bindingState.m_ConstantBufferBindings[stage]);
+            }
+        }
+        if (bindingState.IsBoundAsConstantBuffer() ||
+            bindingState.IsBoundAsVertexBuffer() ||
+            bindingState.IsBoundAsIndexBuffer() ||
+            bindingState.IsBoundAsShaderResource() ||
+            bindingState.IsBoundAsRenderTarget() ||
+            bindingState.IsBoundAsUnorderedAccess() ||
+            bindingState.IsBoundAsDepthStencil() ||
+            bindingState.IsBoundAsStreamOut())
+        {
+            m_ResourceStateManager.TransitionResourceForBindings(pLastResource);
+        }
 
         if (i < Resources)
         {
@@ -5438,7 +5596,8 @@ bool RetiredObject::ReadyToDestroy(ImmediateContext* pContext, bool completionRe
 
     if (completionRequired)
     {
-        readyToDestroy = lastCommandListID <= pContext->GetCompletedFenceValue(commandListType);
+        readyToDestroy = lastCommandListID < pContext->GetCommandListID(commandListType) &&
+            lastCommandListID <= pContext->GetCompletedFenceValue(commandListType);
     }
     else
     {
@@ -5464,7 +5623,8 @@ bool RetiredObject::ReadyToDestroy(ImmediateContext* pContext, bool completionRe
         {
             if (lastCommandListIDs[i] != 0)
             {
-                readyToDestroy = lastCommandListIDs[i] <= pContext->GetCompletedFenceValue((COMMAND_LIST_TYPE)i);
+                readyToDestroy = lastCommandListIDs[i] < pContext->GetCommandListID((COMMAND_LIST_TYPE)i) &&
+                    lastCommandListIDs[i] <= pContext->GetCompletedFenceValue((COMMAND_LIST_TYPE)i);
             }
         }
     }
@@ -5634,6 +5794,9 @@ unique_comptr<ID3D12Resource> ImmediateContext::AllocateHeap(UINT64 HeapSize, UI
     CD3DX12_RANGE NullRange(0, 0);
     void* pData = nullptr;
     ThrowFailure(spResource->Map(0, &NullRange, &pData));
+    {
+        (void)pData;
+    }
 
     return std::move(spResource);
 }

@@ -894,8 +894,8 @@ private:
     // Must be initialized before BindingTracker logic for m_CurrentState
     D3D_FEATURE_LEVEL m_FeatureLevel;
 
-    static constexpr UINT64 m_MaxBufferPoolTrimThreshold = 100;
-    static constexpr UINT64 m_MinBufferPoolTrimThreshold = 5;
+    static constexpr UINT64 m_MaxBufferPoolTrimThreshold = 2000;
+    static constexpr UINT64 m_MinBufferPoolTrimThreshold = 1000;
 
 public:
 
@@ -1204,6 +1204,7 @@ public:
 
     Resource* TRANSLATION_API CreateRenameCookie(Resource* pResource, ResourceAllocationContext threadingContext);
     void TRANSLATION_API Rename(Resource* pResource, Resource* pRenameResource);
+    void TRANSLATION_API RenameSuballocation(Resource* pResource, EncodedResourceSuballocation const& NewSuballocation);
     void TRANSLATION_API RenameViaCopy(Resource* pResource, Resource* pRenameResource, UINT DirtyPlaneMask);
     void TRANSLATION_API DeleteRenameCookie(Resource* pRenameResource);
 
@@ -1661,6 +1662,13 @@ private: // Dynamic/staging resource pools
     }
 
     COptLockedContainer<RenameResourceSet> m_RenamesInFlight;
+
+    void PopulateCachedSuballocationMappings(AllocatorHeapType HeapType, D3D12ResourceSuballocation& suballoc) noexcept;
+
+    unique_comptr<ID3D12DescriptorHeap> m_spCBStagingCpuHeap;
+    D3D12_CPU_DESCRIPTOR_HANDLE m_CBStagingCpuHandles[ShaderStageCount][D3D11_COMMONSHADER_CONSTANT_BUFFER_HW_SLOT_COUNT] = {};
+    D3D12_CONSTANT_BUFFER_VIEW_DESC m_CachedCBVDescs[ShaderStageCount][D3D11_COMMONSHADER_CONSTANT_BUFFER_HW_SLOT_COUNT] = {};
+    bool m_bCBStagingInitialized[ShaderStageCount][D3D11_COMMONSHADER_CONSTANT_BUFFER_HW_SLOT_COUNT] = {};
 
 private: // State tracking
     // Dirty states are marked during sets and converted to command list operations at draw time, to avoid multiple costly conversions due to 11/12 API differences

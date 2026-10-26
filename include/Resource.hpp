@@ -238,7 +238,10 @@ namespace D3D12TranslationLayer
             m_pResource(pResource), m_bufferSubAllocation(allocation) {}
 
         bool IsInitialized() { return GetResource() != nullptr; }
-        void Reset() { m_pResource = nullptr; }
+        void Reset() { m_pResource = nullptr; m_pMappedBase = nullptr; m_BaseGpuVA = 0; }
+        void SetCachedMappings(BYTE* pMappedBase, D3D12_GPU_VIRTUAL_ADDRESS baseGpuVA) noexcept { m_pMappedBase = pMappedBase; m_BaseGpuVA = baseGpuVA; }
+        BYTE* GetMappedCpuPtr() const noexcept { return m_pMappedBase ? (m_pMappedBase + GetOffset()) : nullptr; }
+        D3D12_GPU_VIRTUAL_ADDRESS GetBaseGpuVA() const noexcept { return m_BaseGpuVA; }
         ID3D12Resource *GetResource() const { return m_pResource; }
         UINT64 GetOffset() const {
 
@@ -263,6 +266,14 @@ namespace D3D12TranslationLayer
             _In_opt_  const D3D12_RANGE *pReadRange,
             _Outptr_opt_result_bytebuffer_(_Inexpressible_("Dependent on resource"))  void **ppData)
         {
+            if (m_pMappedBase != nullptr && Subresource == 0 && (pReadRange == nullptr || (pReadRange->Begin == 0 && pReadRange->End == 0)))
+            {
+                if (ppData)
+                {
+                    *ppData = (void*)(m_pMappedBase + GetOffset());
+                }
+                return S_OK;
+            }
             D3D12_RANGE *pOffsetReadRange = nullptr;
             D3D12_RANGE offsetReadRange;
 
@@ -285,6 +296,10 @@ namespace D3D12TranslationLayer
             UINT Subresource,
             _In_opt_  const D3D12_RANGE *pWrittenRange)
         {
+            if (m_pMappedBase != nullptr && Subresource == 0)
+            {
+                return;
+            }
             D3D12_RANGE *pOffsetWrittenRange = nullptr;
             D3D12_RANGE offsetWrittenRange;
 
@@ -328,6 +343,8 @@ namespace D3D12TranslationLayer
     private:
         ID3D12Resource *m_pResource;
         HeapSuballocationBlock m_bufferSubAllocation;
+        BYTE *m_pMappedBase = nullptr;
+        D3D12_GPU_VIRTUAL_ADDRESS m_BaseGpuVA = 0;
     };
 
     struct EncodedResourceSuballocation
@@ -418,6 +435,7 @@ namespace D3D12TranslationLayer
         AppResourceDesc* AppDesc() { return &m_creationArgs.m_appDesc; }
 
         ID3D12Resource* GetUnderlyingResource() noexcept { return m_Identity->GetResource(); }
+        D3D12_GPU_VIRTUAL_ADDRESS GetUnderlyingGpuVA() noexcept { return m_Identity->m_CachedBaseGpuVA ? m_Identity->m_CachedBaseGpuVA : (m_Identity->GetResource() ? m_Identity->GetResource()->GetGPUVirtualAddress() : 0); }
         void UnderlyingResourceChanged() noexcept(false);
         void ZeroConstantBufferPadding() noexcept;
 
@@ -626,6 +644,7 @@ namespace D3D12TranslationLayer
 
             unique_comptr<ID3D12Resource> m_spUnderlyingResource;
             D3D12ResourceSuballocation m_suballocation;
+            D3D12_GPU_VIRTUAL_ADDRESS m_CachedBaseGpuVA = 0;
 
             ID3D12Resource *GetOwnedResource()
             {

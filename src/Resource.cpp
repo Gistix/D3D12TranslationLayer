@@ -604,7 +604,14 @@ namespace D3D12TranslationLayer
     void Resource::UsedInCommandList(COMMAND_LIST_TYPE commandListType, UINT64 id)
     {
         assert(commandListType != COMMAND_LIST_TYPE::UNKNOWN);
-        m_pParent->AddObjectToResidencySet(this, commandListType);
+        if (m_LastUsedCommandListID[(UINT)commandListType] == id)
+        {
+            return;
+        }
+        if (m_Identity && m_Identity->m_pResidencyHandle)
+        {
+            m_pParent->AddObjectToResidencySet(this, commandListType);
+        }
         if (m_Identity && m_Identity->HasRestrictedOutstandingResources())
         {
             OutstandingResourceUse resourceUse(commandListType, id);
@@ -645,6 +652,17 @@ namespace D3D12TranslationLayer
         ResetLastUsedInCommandList();
 
         m_DesiredState.Reset();
+
+        if (Parent()->ResourceDimension12() == D3D12_RESOURCE_DIMENSION_BUFFER)
+        {
+            m_Identity->m_CachedBaseGpuVA = (!m_Identity->m_bOwnsUnderlyingResource && m_Identity->m_suballocation.GetBaseGpuVA() != 0)
+                ? m_Identity->m_suballocation.GetBaseGpuVA()
+                : m_Identity->GetResource()->GetGPUVirtualAddress();
+        }
+        else
+        {
+            m_Identity->m_CachedBaseGpuVA = 0;
+        }
     }
 
     //----------------------------------------------------------------------------------------------------------------------------------
@@ -660,6 +678,11 @@ namespace D3D12TranslationLayer
 
         UINT64 AlignedSize = m_SubresourcePlacement[0].Footprint.RowPitch;
         SIZE_T ZeroSize = static_cast<SIZE_T>(AlignedSize - AppDesc()->Width());
+        if (!m_Identity->m_bOwnsUnderlyingResource && m_Identity->m_suballocation.GetMappedCpuPtr() != nullptr)
+        {
+            ZeroMemory(m_Identity->m_suballocation.GetMappedCpuPtr() + AppDesc()->Width(), ZeroSize);
+            return;
+        }
         void *pData;
         CD3DX12_RANGE ReadRange(0, 0);
         HRESULT hr = GetUnderlyingResource()->Map(0, &ReadRange, &pData);
@@ -690,6 +713,17 @@ namespace D3D12TranslationLayer
     void Resource::InitializeSubresourceDescs() noexcept(false)
     {
         m_Identity->m_bPlacedTexture = m_creationArgs.m_isPlacedTexture;
+        if (AppDesc()->ResourceDimension() == D3D12_RESOURCE_DIMENSION_BUFFER && NumSubresources() == 1 && AppDesc()->Width() > 0)
+        {
+            UINT width = static_cast<UINT>(AppDesc()->Width());
+            m_SubresourcePlacement[0].Offset = 0;
+            m_SubresourcePlacement[0].Footprint.Format = DXGI_FORMAT_UNKNOWN;
+            m_SubresourcePlacement[0].Footprint.Width = width;
+            m_SubresourcePlacement[0].Footprint.Height = 1;
+            m_SubresourcePlacement[0].Footprint.Depth = 1;
+            m_SubresourcePlacement[0].Footprint.RowPitch = Align<UINT>(width, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+            return;
+        }
         CD3DX12_RESOURCE_DESC ResDesc(
             AppDesc()->ResourceDimension(),
             0,

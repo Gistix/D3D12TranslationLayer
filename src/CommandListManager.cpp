@@ -33,7 +33,7 @@ namespace D3D12TranslationLayer
         ResetCommandListTrackingData();
 
         m_MaxAllocatedUploadHeapSpacePerCommandList = min(m_MaxAllocatedUploadHeapSpacePerCommandList,
-            m_pParent->m_CreationArgs.MaxAllocatedUploadHeapSpacePerCommandList);
+            m_pParent->m_CreationArgs.MaxAllocatedUploadHeapSpacePerCommandList ? m_pParent->m_CreationArgs.MaxAllocatedUploadHeapSpacePerCommandList : m_MaxAllocatedUploadHeapSpacePerCommandList);
         
         if (!m_pCommandQueue)
         {
@@ -97,8 +97,8 @@ namespace D3D12TranslationLayer
         // These parameters attempt to avoid regressing already CPU bound applications. 
         // In these cases, submitting too frequently will make the app slower due
         // to frequently re-emitting state and the overhead of submitting/creating command lists
-        static const UINT cMinDrawsOrDispatchesForSubmit = 512;
-        static const UINT cMinRenderOpsForSubmit = 1000;
+        static const UINT cMinDrawsOrDispatchesForSubmit = 2048;
+        static const UINT cMinRenderOpsForSubmit = 4096;
 
         // To further avoid regressing CPU bound applications, we'll stop opportunistic
         // flushing if it appears that the app doesn't need to kick off work early.
