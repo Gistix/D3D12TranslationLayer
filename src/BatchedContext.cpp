@@ -1285,13 +1285,18 @@ void TRANSLATION_API BatchedContext::UnmapRenamedBuffer(BatchedResource* pResour
         try
         {
             auto& ImmCtx = GetImmediateContextNoFlush();
-            SafeRenameResourceCookie cookie(ImmCtx.CreateRenameCookie(pResource->m_pResource, ResourceAllocationContext::FreeThread));
+            SafeRenameResourceCookie cookie(ImmCtx.CreateRenameCookie(
+                pResource->m_pResource, ResourceAllocationContext::FreeThread));
             Resource* pRenameResource = cookie.Get();
             D3D12ResourceSuballocation suballoc = pRenameResource->GetIdentity()->m_suballocation;
             BYTE* pDst = suballoc.GetMappedCpuPtr();
             if (pDst)
             {
                 memcpy(pDst, pResource->m_pCBWriteScratch, pResource->m_CBWidth);
+                if (pResource->m_CBAlignedSize > pResource->m_CBWidth)
+                {
+                    memset(pDst + pResource->m_CBWidth, 0, pResource->m_CBAlignedSize - pResource->m_CBWidth);
+                }
             }
             else
             {
@@ -1299,13 +1304,15 @@ void TRANSLATION_API BatchedContext::UnmapRenamedBuffer(BatchedResource* pResour
                 void* pData = nullptr;
                 ThrowFailure(suballoc.Map(0, &ReadRange, &pData));
                 memcpy(pData, pResource->m_pCBWriteScratch, pResource->m_CBWidth);
+                if (pResource->m_CBAlignedSize > pResource->m_CBWidth)
+                {
+                    memset(static_cast<BYTE*>(pData) + pResource->m_CBWidth, 0, pResource->m_CBAlignedSize - pResource->m_CBWidth);
+                }
                 D3D12_RANGE WriteRange = CD3DX12_RANGE(0, pResource->m_CBAlignedSize);
                 suballoc.Unmap(0, &WriteRange);
             }
             pResource->m_LastRenamedResource = suballoc;
             AddToBatch(CmdRename{ pResource->m_pResource, cookie.Detach() });
-        if (false)
-            AddPostBatchFunction([cleanup = cookie.Detach(), &immCtx = GetImmediateContextNoFlush()]() { immCtx.DeleteRenameCookie(cleanup); });
         }
         catch (_com_error& hrEx)
         {
