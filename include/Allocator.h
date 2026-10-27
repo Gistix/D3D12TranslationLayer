@@ -149,7 +149,10 @@ namespace D3D12TranslationLayer
 
         void Deallocate(const _BlockType &block)
         {
-            assert(IsOwner(block));
+            if (block.GetSize() == 0)
+            {
+                return;
+            }
             if (block.IsDirectAllocation()) { m_DirectAllocator.Deallocate(block); }
             else { m_SuballocationAllocator.Deallocate(block); }
         }

@@ -291,12 +291,19 @@ _BlockType CDisjointBuddyAllocator<_BlockType, _InnerAllocator, _SizeType, _MinB
 template<class _BlockType, class _InnerAllocator, class _SizeType, _SizeType _MinBlockSize>
 void CDisjointBuddyAllocator<_BlockType, _InnerAllocator, _SizeType, _MinBlockSize>::Deallocate(const _BlockType &block)
 {
-    assert(IsOwner(block));
+    if (block.GetSize() == 0 || !IsOwner(block))
+    {
+        return;
+    }
     
     _SizeType offset = block.GetOffset();
     UINT bucket = BucketFromOffset(offset);
 
-    assert(bucket < m_Allocations.size());
+    if (bucket >= m_Allocations.size() || m_Allocations[bucket].m_Refcount == 0)
+    {
+        return;
+    }
+
     if (--m_Allocations[bucket].m_Refcount == 0)
     {
         m_InnerAllocator.Deallocate(m_Allocations[bucket].m_Allocation);
@@ -329,13 +336,18 @@ void CDisjointBuddyAllocator<_BlockType, _InnerAllocator, _SizeType, _MinBlockSi
 template<class _BlockType, class _InnerAllocator, class _SizeType, _SizeType _MinBlockSize>
 auto CDisjointBuddyAllocator<_BlockType, _InnerAllocator, _SizeType, _MinBlockSize>::GetInnerAllocation(const _BlockType &block) const -> AllocationType
 {
-    assert(IsOwner(block));
+    if (!IsOwner(block))
+    {
+        return nullptr;
+    }
     
     _SizeType offset = block.GetOffset();
     UINT bucket = BucketFromOffset(offset);
 
-    assert(bucket < m_Allocations.size());
-    assert(m_Allocations[bucket].m_Refcount > 0);
+    if (bucket >= m_Allocations.size() || m_Allocations[bucket].m_Refcount == 0)
+    {
+        return nullptr;
+    }
     return m_Allocations[bucket].m_Allocation;
 }
 

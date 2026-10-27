@@ -550,9 +550,16 @@ public:
         return m_ImmCtx;
     }
 
+        bool IsRecordingThread() const noexcept
+    {
+        DWORD cur = GetCurrentThreadId();
+        DWORD expected = m_RecordingThreadId.load(std::memory_order_relaxed);
+        return expected == 0 || cur == expected;
+    }
+
     template <typename TFunc> void AddPostBatchFunction(TFunc&& f)
     {
-        auto Lock = m_RecordingLock.TakeLock();
+        auto Lock = m_PostBatchLock.TakeLock();
         m_PostBatchFunctions.emplace_back(std::forward<TFunc>(f));
     }
     template <typename T>
@@ -562,14 +569,23 @@ public:
     }
     void TRANSLATION_API ReleaseResource(Resource* pResource)
     {
-        auto Lock = m_RecordingLock.TakeLock();
         auto Size = pResource->GetResourceSize();
-        m_PostBatchFunctions.emplace_back([pResource]() { pResource->Release(); });
-        m_PendingDestructionMemorySize += Size;
+        {
+            auto Lock = m_PostBatchLock.TakeLock();
+            m_PostBatchFunctions.emplace_back([pResource]() { pResource->Release(); });
+            m_PendingDestructionMemorySize += Size;
+        }
         if (m_PendingDestructionMemorySize >= 64 * 1024 * 1024 ||
             pResource->Parent()->IsShared())
         {
-            SubmitBatch();
+            if (IsRecordingThread())
+            {
+                SubmitBatch();
+            }
+            else
+            {
+                m_bDestructionFlushRequested.store(true, std::memory_order_release);
+            }
         }
     }
 
@@ -703,6 +719,7 @@ public:
     {
         assert(!IsBatchThread());
         auto Lock = m_RecordingLock.TakeLock();
+        m_RecordingThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
         static_assert(std::is_trivially_destructible<TExt>::value, "Destructors don't get called on batched commands.");
         const size_t ExtensionSize = TExt::GetExtensionSize(std::forward<Args>(args)...);
         const size_t CommandSize = CmdExtension::GetCommandSize(pExt, nullptr, ExtensionSize);
@@ -716,7 +733,18 @@ public:
         auto pExtensionCmd = new (pPtr) CmdExtension(pExt, nullptr, ExtensionSize);
         new (AlignPtr(pExtensionCmd + 1)) TExt(std::forward<Args>(args)...);
         ++m_CurrentCommandCount;
-        SubmitBatchIfIdle();
+        if (IsRecordingThread())
+        {
+            if (m_bDestructionFlushRequested.load(std::memory_order_relaxed))
+            {
+                m_bDestructionFlushRequested.store(false, std::memory_order_relaxed);
+                SubmitBatch();
+            }
+            else
+            {
+                SubmitBatchIfIdle();
+            }
+        }
     }
 
     using DispatcherFunction = void(*)(ImmediateContext&, const void*&);
@@ -731,11 +759,24 @@ private:
     template <typename TCmd> void AddToBatch(BatchStorage& CurrentBatch, TCmd const& command);
     template <typename TCmd> void AddToBatch(TCmd const& command)
     {
+        assert(!IsBatchThread());
         auto Lock = m_RecordingLock.TakeLock();
+        m_RecordingThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
         AddToBatch(m_CurrentBatch, command);
 
         ++m_CurrentCommandCount;
-        SubmitBatchIfIdle();
+        if (IsRecordingThread())
+        {
+            if (m_bDestructionFlushRequested.load(std::memory_order_relaxed))
+            {
+                m_bDestructionFlushRequested.store(false, std::memory_order_relaxed);
+                SubmitBatch();
+            }
+            else
+            {
+                SubmitBatchIfIdle();
+            }
+        }
     }
     template <typename TCmd, typename TEntry> void AddToBatchVariableSize(TCmd const& command, UINT NumEntries, TEntry const* entries);
     template <typename TCmd, typename... Args> void EmplaceInBatch(Args&&... args);
@@ -789,6 +830,9 @@ private: // Referenced by recording thread
 
     static constexpr UINT c_CommandKickoffMinThreshold = 256; // Avoid micro-batching and kernel wait syscalls every 10 commands
     OptLock<std::recursive_mutex> m_RecordingLock{ m_CreationArgs.CreatesAndDestroysAreMultithreaded };
+    OptLock<std::mutex> m_PostBatchLock{ m_CreationArgs.CreatesAndDestroysAreMultithreaded };
+    std::atomic<bool> m_bDestructionFlushRequested{ false };
+    std::atomic<DWORD> m_RecordingThreadId{ 0 };
     UINT m_CurrentCommandCount = 0;
     UINT m_NumOutstandingBatches = 0;
     uint64_t m_RecordingBatchID = 1;

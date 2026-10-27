@@ -752,6 +752,10 @@ public:
 
     void AddSuballocationToQueue(HeapSuballocationBlock &suballocation, ConditionalHeapAllocator &parentAllocator, COMMAND_LIST_TYPE CommandListType, UINT64 lastCommandListID)
     {
+        if (suballocation.GetSize() == 0)
+        {
+            return;
+        }
         RetiredSuballocationBlock retiredSuballocation(suballocation, parentAllocator, CommandListType, lastCommandListID);
         if (!retiredSuballocation.ReadyToDestroy(m_pParent))
         {
@@ -765,6 +769,10 @@ public:
 
     void AddSuballocationToQueue(HeapSuballocationBlock &suballocation, ConditionalHeapAllocator &parentAllocator, const UINT64 lastCommandListIDs[(UINT)COMMAND_LIST_TYPE::MAX_VALID])
     {
+        if (suballocation.GetSize() == 0)
+        {
+            return;
+        }
         RetiredSuballocationBlock retiredSuballocation(suballocation, parentAllocator, lastCommandListIDs);
         if (!retiredSuballocation.ReadyToDestroy(m_pParent))
         {

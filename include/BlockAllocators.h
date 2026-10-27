@@ -327,7 +327,10 @@ public:
 
     inline bool IsOwner(_In_ const _BlockType &block) const
     {
-        return block.GetOffset() >= m_baseOffset && block.GetSize() <= m_maxBlockSize;
+        return block.GetSize() > 0 &&
+               block.GetSize() <= m_maxBlockSize &&
+               block.GetOffset() >= m_baseOffset &&
+               (block.GetOffset() - m_baseOffset) <= (m_maxBlockSize - block.GetSize());
     }
 
     inline void Reset()

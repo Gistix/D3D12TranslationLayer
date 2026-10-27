@@ -1102,11 +1102,21 @@ void ImmediateContext::PostUpload()
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------
+inline bool IsSuballocatedUploadBuffer(Resource* pBuffer) noexcept
+{
+    auto* pIdentity = pBuffer->GetIdentity();
+    return pIdentity && !pIdentity->m_bOwnsUnderlyingResource && pBuffer->GetAllocatorHeapType() == AllocatorHeapType::Upload;
+}
+
+//----------------------------------------------------------------------------------------------------------------------------------
 void ImmediateContext::ConstantBufferBound(Resource* pBuffer, UINT slot, EShaderStage stage) noexcept
 {
     if (pBuffer == nullptr) return;
     pBuffer->m_currentBindings.ConstantBufferBound(stage, slot);
-    pBuffer->m_pParent->m_ResourceStateManager.TransitionResourceForBindings(pBuffer);
+    if (!IsSuballocatedUploadBuffer(pBuffer))
+    {
+        pBuffer->m_pParent->m_ResourceStateManager.TransitionResourceForBindings(pBuffer);
+    }
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------
@@ -1114,7 +1124,10 @@ void ImmediateContext::ConstantBufferUnbound(Resource* pBuffer, UINT slot, EShad
 {
     if (pBuffer == nullptr) return;
     pBuffer->m_currentBindings.ConstantBufferUnbound(stage, slot);
-    pBuffer->m_pParent->m_ResourceStateManager.TransitionResourceForBindings(pBuffer);
+    if (!IsSuballocatedUploadBuffer(pBuffer))
+    {
+        pBuffer->m_pParent->m_ResourceStateManager.TransitionResourceForBindings(pBuffer);
+    }
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------
@@ -1122,7 +1135,10 @@ void ImmediateContext::VertexBufferBound(Resource* pBuffer, UINT slot) noexcept
 {
     if (pBuffer == nullptr) return;
     pBuffer->m_currentBindings.VertexBufferBound(slot);
-    pBuffer->m_pParent->m_ResourceStateManager.TransitionResourceForBindings(pBuffer);
+    if (!IsSuballocatedUploadBuffer(pBuffer))
+    {
+        pBuffer->m_pParent->m_ResourceStateManager.TransitionResourceForBindings(pBuffer);
+    }
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------
@@ -1130,7 +1146,10 @@ void ImmediateContext::VertexBufferUnbound(Resource* pBuffer, UINT slot) noexcep
 {
     if (pBuffer == nullptr) return;
     pBuffer->m_currentBindings.VertexBufferUnbound(slot);
-    pBuffer->m_pParent->m_ResourceStateManager.TransitionResourceForBindings(pBuffer);
+    if (!IsSuballocatedUploadBuffer(pBuffer))
+    {
+        pBuffer->m_pParent->m_ResourceStateManager.TransitionResourceForBindings(pBuffer);
+    }
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------
@@ -1138,7 +1157,10 @@ void ImmediateContext::IndexBufferBound(Resource* pBuffer) noexcept
 {
     if (pBuffer == nullptr) return;
     pBuffer->m_currentBindings.IndexBufferBound();
-    pBuffer->m_pParent->m_ResourceStateManager.TransitionResourceForBindings(pBuffer);
+    if (!IsSuballocatedUploadBuffer(pBuffer))
+    {
+        pBuffer->m_pParent->m_ResourceStateManager.TransitionResourceForBindings(pBuffer);
+    }
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------
@@ -1146,7 +1168,10 @@ void ImmediateContext::IndexBufferUnbound(Resource* pBuffer) noexcept
 {
     if (pBuffer == nullptr) return;
     pBuffer->m_currentBindings.IndexBufferUnbound();
-    pBuffer->m_pParent->m_ResourceStateManager.TransitionResourceForBindings(pBuffer);
+    if (!IsSuballocatedUploadBuffer(pBuffer))
+    {
+        pBuffer->m_pParent->m_ResourceStateManager.TransitionResourceForBindings(pBuffer);
+    }
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------
@@ -5485,8 +5510,11 @@ void TRANSLATION_API ImmediateContext::RotateResourceIdentities(Resource* const*
         {
             for (UINT stage = 0; stage < ShaderStageCount; ++stage)
             {
-                auto& stageState = m_CurrentState.GetStageState((EShaderStage)stage);
-                stageState.m_CBs.SetDirtyBits(bindingState.m_ConstantBufferBindings[stage]);
+                if (bindingState.m_ConstantBufferBindings[stage].any())
+                {
+                    auto& stageState = m_CurrentState.GetStageState((EShaderStage)stage);
+                    stageState.m_CBs.SetDirtyBits(bindingState.m_ConstantBufferBindings[stage]);
+                }
             }
         }
         if (bindingState.IsBoundAsConstantBuffer() ||

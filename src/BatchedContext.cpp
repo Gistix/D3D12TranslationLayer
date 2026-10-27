@@ -657,6 +657,7 @@ BatchedContext::BatchedContext(ImmediateContext& ImmCtx, CreationArgs args, Call
     , m_DispatchTable(DispatchArray)
     , m_Callbacks(callbacks)
 {
+    m_RecordingThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
     if (args.SubmitBatchesToWorkerThread)
     {
         m_BatchSubmittedSemaphore.m_h = CreateSemaphore(nullptr, 0, c_MaxOutstandingBatches, nullptr);
@@ -725,6 +726,7 @@ void BatchedContext::AddToBatchVariableSize(TCmd const& command, UINT NumEntries
 {
     assert(!IsBatchThread());
     auto Lock = m_RecordingLock.TakeLock();
+    m_RecordingThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
     static_assert(std::is_trivially_destructible<TCmd>::value, "Destructors don't get called on batched commands.");
     struct Temp { UINT CommandValue; TCmd Command; TEntry FirstEntry; };
 
@@ -742,7 +744,18 @@ void BatchedContext::AddToBatchVariableSize(TCmd const& command, UINT NumEntries
     std::copy(entries, entries + NumEntries, &pPtr->FirstEntry);
 
     ++m_CurrentCommandCount;
-    SubmitBatchIfIdle();
+    if (IsRecordingThread())
+    {
+        if (m_bDestructionFlushRequested.load(std::memory_order_relaxed))
+        {
+            m_bDestructionFlushRequested.store(false, std::memory_order_relaxed);
+            SubmitBatch();
+        }
+        else
+        {
+            SubmitBatchIfIdle();
+        }
+    }
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------
@@ -751,6 +764,7 @@ void BatchedContext::EmplaceInBatch(Args&&... args)
 {
     assert(!IsBatchThread());
     auto Lock = m_RecordingLock.TakeLock();
+    m_RecordingThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
     static_assert(std::is_trivially_destructible<TCmd>::value, "Destructors don't get called on batched commands.");
     const size_t CommandSize = TCmd::GetCommandSize(std::forward<Args>(args)...);
     // GetCommandSize must ensure size is aligned correctly.
@@ -765,7 +779,18 @@ void BatchedContext::EmplaceInBatch(Args&&... args)
     new (pPtr) TCmd(std::forward<Args>(args)...);
 
     ++m_CurrentCommandCount;
-    SubmitBatchIfIdle();
+    if (IsRecordingThread())
+    {
+        if (m_bDestructionFlushRequested.load(std::memory_order_relaxed))
+        {
+            m_bDestructionFlushRequested.store(false, std::memory_order_relaxed);
+            SubmitBatch();
+        }
+        else
+        {
+            SubmitBatchIfIdle();
+        }
+    }
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------
@@ -1871,15 +1896,21 @@ std::unique_ptr<BatchedContext::Batch> BatchedContext::FinishBatch(bool bFlushIm
     std::vector<std::function<void()>> NewPostBatchFunctions;
     std::unique_ptr<Batch> pRet;
 
-    // Synchronize with threads recording to the batch
+    // Swap post-batch functions safely
+    {
+        auto Lock = m_PostBatchLock.TakeLock();
+        std::swap(m_PostBatchFunctions, NewPostBatchFunctions);
+        m_PendingDestructionMemorySize = 0;
+    }
+
+    // Synchronize with threads reading recording batch state
     {
         auto Lock = m_RecordingLock.TakeLock();
-        if (m_CurrentBatch.empty() && m_PostBatchFunctions.empty())
+        if (m_CurrentBatch.empty() && NewPostBatchFunctions.empty())
         {
             return nullptr;
         }
         std::swap(m_CurrentBatch, NewBatch);
-        std::swap(m_PostBatchFunctions, NewPostBatchFunctions);
 
         // Synchronize with the worker thread potentially retiring batches
         {
@@ -1889,7 +1920,6 @@ std::unique_ptr<BatchedContext::Batch> BatchedContext::FinishBatch(bool bFlushIm
 
         pRet->PrepareToSubmit(std::move(NewBatch), std::move(NewPostBatchFunctions), m_RecordingBatchID, m_CurrentCommandCount, bFlushImmCtxAfterBatch);
         m_CurrentCommandCount = 0;
-        m_PendingDestructionMemorySize = 0;
 
         ++m_RecordingBatchID;
         if (static_cast<uint32_t>(m_RecordingBatchID) == 0)
