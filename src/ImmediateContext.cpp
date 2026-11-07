@@ -555,6 +555,7 @@ void TRANSLATION_API ImmediateContext::PostSubmitNotification()
         m_callbacks.m_pfnPostSubmit();
     }
     TrimDeletedObjects();
+    m_DynamicCBPool.FlushRetired(); // DX12Rim: let the recording thread reuse blocks freed by this submission
     if ((GetCommandListID(COMMAND_LIST_TYPE::GRAPHICS) & 63) == 0)
     {
         TrimResourcePools();
@@ -4263,6 +4264,16 @@ void ImmediateContext::ReturnAllBuffersToPool(Resource& UnderlyingResource) noex
 
         assert(UnderlyingResource.AppDesc()->CPUAccessFlags() != 0);
 
+        // DX12Rim: blocks from the dynamic CB pool must never reach the buddy allocators.
+        if (DynamicCBSuballocationPool::IsPoolBlock(UnderlyingResource.m_Identity->m_suballocation.GetBufferSuballocation()))
+        {
+            m_DynamicCBPool.Retire(
+                UnderlyingResource.m_Identity->m_suballocation.GetBufferSuballocation(),
+                UnderlyingResource.m_LastUsedCommandListID);
+            UnderlyingResource.m_Identity->m_suballocation.Reset();
+            return;
+        }
+
         ReleaseSuballocatedHeap(
             HeapType, 
             UnderlyingResource.m_Identity->m_suballocation,
@@ -4406,7 +4417,14 @@ void TRANSLATION_API ImmediateContext::RenameSuballocation(Resource* pResource, 
     ReturnAllBuffersToPool(*pResource);
 
     D3D12ResourceSuballocation suballoc = NewSuballocation.Decode();
-    PopulateCachedSuballocationMappings(pResource->GetAllocatorHeapType(), suballoc);
+    if (DynamicCBSuballocationPool::IsPoolBlock(suballoc.GetBufferSuballocation()))
+    {
+        m_DynamicCBPool.ApplyCachedMappings(suballoc);
+    }
+    else
+    {
+        PopulateCachedSuballocationMappings(pResource->GetAllocatorHeapType(), suballoc);
+    }
     pResource->m_Identity->m_suballocation = suballoc;
     pResource->m_SubresourcePlacement[0].Offset = suballoc.GetOffset();
 
@@ -5619,6 +5637,243 @@ bool RetiredObject::DeferredWaitsSatisfied(const std::vector<DeferredWait>& defe
     }
 
     return true;
+}
+
+//----------------------------------------------------------------------------------------------------------------------------------
+//==================================================================================================================================
+// DynamicCBSuballocationPool (DX12Rim)
+//==================================================================================================================================
+D3D12ResourceSuballocation DynamicCBSuballocationPool::MakeSuballocation(UINT64 TaggedOffset, UINT Class) const noexcept
+{
+    Page const& page = m_Pages[PageIndexOf(TaggedOffset)];
+    D3D12ResourceSuballocation suballoc(page.spResource.get(), HeapSuballocationBlock(TaggedOffset, ClassToSize(Class)));
+    suballoc.SetCachedMappings(page.pCpu, page.GpuVA);
+    return suballoc;
+}
+
+//----------------------------------------------------------------------------------------------------------------------------------
+void DynamicCBSuballocationPool::ApplyCachedMappings(D3D12ResourceSuballocation& Suballoc) const noexcept
+{
+    Page const& page = m_Pages[PageIndexOf(Suballoc.GetBufferSuballocation().GetOffset())];
+    Suballoc.SetCachedMappings(page.pCpu, page.GpuVA);
+}
+
+//----------------------------------------------------------------------------------------------------------------------------------
+void DynamicCBSuballocationPool::PushFree(UINT Class, UINT64 TaggedOffset) noexcept
+{
+    try
+    {
+        m_Free[Class].push_back(TaggedOffset);
+    }
+    catch (std::bad_alloc&)
+    {
+        // Leaking a block under OOM is harmless; the page is released at device destruction.
+    }
+}
+
+//----------------------------------------------------------------------------------------------------------------------------------
+bool DynamicCBSuballocationPool::AddPage(ImmediateContext& Ctx) noexcept
+{
+    if (m_NumPages >= c_MaxPages)
+    {
+        return false;
+    }
+    try
+    {
+        if (!m_Pages)
+        {
+            m_Pages = std::make_unique<Page[]>(c_MaxPages);
+        }
+
+        D3D12_HEAP_PROPERTIES HeapProps = Ctx.GetHeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+        D3D12_RESOURCE_DESC Desc = CD3DX12_RESOURCE_DESC::Buffer(c_PageSize);
+        unique_comptr<ID3D12Resource> spResource;
+        if (FAILED(Ctx.m_pDevice12->CreateCommittedResource(
+                &HeapProps, D3D12_HEAP_FLAG_NONE, &Desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr, IID_PPV_ARGS(&spResource))))
+        {
+            return false;
+        }
+
+        void* pData = nullptr;
+        CD3DX12_RANGE NullRange(0, 0);
+        if (FAILED(spResource->Map(0, &NullRange, &pData)) || !pData)
+        {
+            return false;
+        }
+
+        Page& page = m_Pages[m_NumPages];
+        page.pCpu = static_cast<BYTE*>(pData);
+        page.GpuVA = spResource->GetGPUVirtualAddress();
+        page.spResource = std::move(spResource);
+        ++m_NumPages;
+        m_CarveOffset = 0;
+        return true;
+    }
+    catch (std::bad_alloc&)
+    {
+        return false;
+    }
+}
+
+//----------------------------------------------------------------------------------------------------------------------------------
+// Moves every retired block whose command lists have completed onto the free lists. Blocks are retired in roughly
+// increasing command list order, so stop at the first block that is still in flight.
+void DynamicCBSuballocationPool::Reclaim(ImmediateContext& Ctx) noexcept
+{
+    if (m_RetiredHead >= m_Retired.size())
+    {
+        return;
+    }
+
+    UINT64 Completed[(UINT)COMMAND_LIST_TYPE::MAX_VALID];
+    UINT64 Current[(UINT)COMMAND_LIST_TYPE::MAX_VALID];
+    for (UINT i = 0; i < (UINT)COMMAND_LIST_TYPE::MAX_VALID; ++i)
+    {
+        Completed[i] = Ctx.GetCompletedFenceValue((COMMAND_LIST_TYPE)i);
+        Current[i] = Ctx.GetCommandListIDInterlockedRead((COMMAND_LIST_TYPE)i); // batch thread advances this
+    }
+
+    const size_t End = m_Retired.size();
+    size_t Head = m_RetiredHead;
+    for (; Head < End; ++Head)
+    {
+        RetiredBlock const& front = m_Retired[Head];
+        bool bReady = true;
+        for (UINT i = 0; i < (UINT)COMMAND_LIST_TYPE::MAX_VALID && bReady; ++i)
+        {
+            UINT64 id = front.LastCommandListIDs[i];
+            if (id != 0)
+            {
+                bReady = id < Current[i] && id <= Completed[i];
+            }
+        }
+        if (!bReady)
+        {
+            break;
+        }
+        PushFree(UINT(front.TaggedOffsetAndClass & c_ClassMask), front.TaggedOffsetAndClass & ~c_ClassMask);
+    }
+    m_RetiredHead = Head;
+
+    // Compact once the consumed prefix dominates, so the vector doesn't grow without bound.
+    if (m_RetiredHead == m_Retired.size())
+    {
+        m_Retired.clear();
+        m_RetiredHead = 0;
+    }
+    else if (m_RetiredHead >= 4096 && m_RetiredHead * 2 >= m_Retired.size())
+    {
+        m_Retired.erase(m_Retired.begin(), m_Retired.begin() + m_RetiredHead);
+        m_RetiredHead = 0;
+    }
+}
+
+//----------------------------------------------------------------------------------------------------------------------------------
+bool DynamicCBSuballocationPool::Allocate(ImmediateContext& Ctx, UINT64 Size, D3D12ResourceSuballocation& Out) noexcept
+{
+    if (Size == 0 || Size > c_PageSize)
+    {
+        return false;
+    }
+    const UINT Class = SizeToClass(Size);
+    const UINT64 BlockSize = ClassToSize(Class);
+
+    std::lock_guard<std::mutex> Lock(m_Lock);
+
+    if (m_Free[Class].empty())
+    {
+        Reclaim(Ctx);
+    }
+    if (!m_Free[Class].empty())
+    {
+        UINT64 TaggedOffset = m_Free[Class].back();
+        m_Free[Class].pop_back();
+        Out = MakeSuballocation(TaggedOffset, Class);
+        return true;
+    }
+
+    // Carve a fresh block from the current page.
+    if (m_NumPages == 0 || m_CarveOffset + BlockSize > c_PageSize)
+    {
+        // Hand the unused tail of the current page to the smaller classes (offsets are always 256B aligned).
+        if (m_NumPages != 0)
+        {
+            while (m_CarveOffset < c_PageSize)
+            {
+                UINT64 Remaining = c_PageSize - m_CarveOffset;
+                UINT TailClass = c_NumClasses - 1;
+                while (ClassToSize(TailClass) > Remaining || (m_CarveOffset & (ClassToSize(TailClass) - 1)) != 0)
+                {
+                    --TailClass;
+                }
+                PushFree(TailClass, c_TagBit | (UINT64(m_NumPages - 1) << c_PageIndexShift) | m_CarveOffset);
+                m_CarveOffset += ClassToSize(TailClass);
+            }
+        }
+        if (!AddPage(Ctx))
+        {
+            return false;
+        }
+    }
+
+    UINT64 TaggedOffset = c_TagBit | (UINT64(m_NumPages - 1) << c_PageIndexShift) | m_CarveOffset;
+    m_CarveOffset += BlockSize;
+    Out = MakeSuballocation(TaggedOffset, Class);
+    return true;
+}
+
+//----------------------------------------------------------------------------------------------------------------------------------
+void DynamicCBSuballocationPool::Retire(HeapSuballocationBlock const& Block, const UINT64 LastCommandListIDs[(UINT)COMMAND_LIST_TYPE::MAX_VALID]) noexcept
+{
+    assert(IsPoolBlock(Block));
+    assert((Block.GetOffset() & c_ClassMask) == 0);
+    RetiredBlock retired;
+    retired.TaggedOffsetAndClass = Block.GetOffset() | SizeToClass(Block.GetSize());
+    std::copy(LastCommandListIDs, LastCommandListIDs + (UINT)COMMAND_LIST_TYPE::MAX_VALID, retired.LastCommandListIDs);
+
+    bool bFlush = false;
+    {
+        std::lock_guard<std::mutex> Lock(m_StagingLock);
+        try
+        {
+            if (m_RetiredStaging.capacity() == 0)
+            {
+                m_RetiredStaging.reserve(c_RetireFlushThreshold * 4);
+            }
+            m_RetiredStaging.push_back(retired);
+        }
+        catch (std::bad_alloc&)
+        {
+            // Dropping the block leaks 256B-64KB until device destruction; acceptable under OOM.
+            return;
+        }
+        bFlush = m_RetiredStaging.size() >= c_RetireFlushThreshold;
+    }
+    if (bFlush)
+    {
+        FlushRetired();
+    }
+}
+
+//----------------------------------------------------------------------------------------------------------------------------------
+void DynamicCBSuballocationPool::FlushRetired() noexcept
+{
+    std::lock_guard<std::mutex> StagingLock(m_StagingLock);
+    if (m_RetiredStaging.empty())
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> Lock(m_Lock);
+    try
+    {
+        m_Retired.insert(m_Retired.end(), m_RetiredStaging.begin(), m_RetiredStaging.end());
+        m_RetiredStaging.clear();
+    }
+    catch (std::bad_alloc&)
+    {
+        // Keep the staged blocks and try again on the next flush.
+    }
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------

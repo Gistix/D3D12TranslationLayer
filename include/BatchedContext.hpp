@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 #pragma once
+#include <intrin.h>
+#include <xmmintrin.h>
 
 namespace D3D12TranslationLayer
 {
@@ -35,6 +37,19 @@ public:
     ~FreePageContainer();
     void* RemovePage() noexcept;
 };
+
+// DX12Rim: batch pages are written by the recording thread and read by the batch thread, so every 64B line moves
+// between cores. Profiling showed the recording thread stalling on a full store buffer (RFO misses) in AddToBatch and
+// the batch thread stalling on the first read of each command. Request the lines a few commands ahead.
+static constexpr size_t c_BatchPrefetchDistance = 512;
+inline void PrefetchBatchWrite(const void* p) noexcept
+{
+    _m_prefetchw(static_cast<const char*>(p) + c_BatchPrefetchDistance);
+}
+inline void PrefetchBatchRead(const void* p) noexcept
+{
+    _mm_prefetch(static_cast<const char*>(p) + c_BatchPrefetchDistance, _MM_HINT_T0);
+}
 
 class BatchedContext
 {
@@ -730,6 +745,7 @@ public:
         }
 
         void* pPtr = m_CurrentBatch.append_contiguous_manually(CommandSize / sizeof(BatchPrimitive));
+        PrefetchBatchWrite(pPtr);
         auto pExtensionCmd = new (pPtr) CmdExtension(pExt, nullptr, ExtensionSize);
         new (AlignPtr(pExtensionCmd + 1)) TExt(std::forward<Args>(args)...);
         ++m_CurrentCommandCount;

@@ -846,6 +846,110 @@ struct ResourceInfo
 
 using RenameResourceSet = std::deque<unique_comptr<Resource>>;
 
+//==================================================================================================================================
+// DynamicCBSuballocationPool  (DX12Rim)
+//
+// Fence-recycled slab pool for dynamic constant buffer contents. Replaces the per-update rename cookie
+// (CreateRenameCookie + buddy allocator + DeleteRenameCookie + deferred deletion queue) on the hot
+// Map(DISCARD)/Unmap path for small dynamic CBs.
+//
+// * Memory comes from persistently-mapped 64KB UPLOAD committed buffers ("pages"). 64KB is required because
+//   D3D12ResourceSuballocation::GetOffset() reduces non-direct offsets modulo cBuddyAllocatorThreshold.
+// * Blocks are power-of-two sizes from 256B to 64KB (CBV alignment is 256B), kept in per-size free lists.
+// * Pool blocks are tagged by setting c_TagBit in the block offset. The page index is stored in bits [16,62),
+//   the in-page offset in bits [0,16). Only the buddy allocators interpret raw offsets, and pool blocks never
+//   reach them: ImmediateContext::ReturnAllBuffersToPool routes them back here.
+// * A block is retired with the owning resource's last-used command list IDs and only reused once the GPU has
+//   completed those command lists, exactly like the deferred suballocation deletion queue.
+//
+// Threading: Allocate() runs on the recording (app) thread, Retire() on the batch thread (or on the app thread when
+// batching is off). Retire() appends to a staging vector under m_StagingLock, which only retirers touch, so its cache
+// line stays on the batch thread's core. Staged blocks move to the shared m_Retired vector (under m_Lock) in bulk:
+// every c_RetireFlushThreshold retirements and after each command list submission (FlushRetired).
+// Both vectors are contiguous: an earlier std::deque version paid a heap node and a cross-core cache miss per block.
+//==================================================================================================================================
+class DynamicCBSuballocationPool
+{
+public:
+    static constexpr UINT64 c_PageSize = cBuddyAllocatorThreshold; // must stay equal, see GetOffset()
+    static constexpr UINT   c_MinBlockShift = 8;                   // 256 bytes
+    static constexpr UINT   c_NumClasses = 9;                      // 256B .. 64KB
+    static constexpr UINT   c_MaxPages = 8192;                     // 512MB hard cap, falls back to the old path beyond it
+    static constexpr UINT   c_PageIndexShift = 16;
+    static constexpr UINT64 c_TagBit = 1ull << 62;
+
+    DynamicCBSuballocationPool() = default;
+    DynamicCBSuballocationPool(DynamicCBSuballocationPool const&) = delete;
+    DynamicCBSuballocationPool& operator=(DynamicCBSuballocationPool const&) = delete;
+
+    static bool IsPoolBlock(HeapSuballocationBlock const& block) noexcept
+    {
+        return !block.IsDirectAllocation() && (block.GetOffset() & c_TagBit) != 0;
+    }
+
+    // Recording thread. Returns false if the pool can't satisfy the request; callers fall back to the rename cookie path.
+    bool Allocate(ImmediateContext& Ctx, UINT64 Size, D3D12ResourceSuballocation& Out) noexcept;
+
+    // Any thread. The block must satisfy IsPoolBlock().
+    void Retire(HeapSuballocationBlock const& Block, const UINT64 LastCommandListIDs[(UINT)COMMAND_LIST_TYPE::MAX_VALID]) noexcept;
+
+    // Any thread. Publishes staged retirements to the allocator. Called after each command list submission.
+    void FlushRetired() noexcept;
+
+    // Restores the CPU/GPU base pointers on a suballocation that went through EncodedResourceSuballocation.
+    // Safe without the lock: a page's entry is written once, before any block from it is handed out.
+    void ApplyCachedMappings(D3D12ResourceSuballocation& Suballoc) const noexcept;
+
+    bool m_bEnabled = true;
+
+private:
+    struct Page
+    {
+        unique_comptr<ID3D12Resource> spResource;
+        BYTE* pCpu = nullptr;
+        D3D12_GPU_VIRTUAL_ADDRESS GpuVA = 0;
+    };
+    // Offsets are 256B aligned, so the size class is packed into the low bits of the tagged offset.
+    static constexpr UINT64 c_ClassMask = 0xF;
+    static_assert(c_NumClasses <= c_ClassMask + 1, "size class must fit in the low offset bits");
+    static constexpr size_t c_RetireFlushThreshold = 256;
+    struct RetiredBlock
+    {
+        UINT64 TaggedOffsetAndClass;
+        UINT64 LastCommandListIDs[(UINT)COMMAND_LIST_TYPE::MAX_VALID];
+    };
+
+    static UINT SizeToClass(UINT64 Size) noexcept
+    {
+        UINT cls = 0;
+        while ((UINT64(1) << (c_MinBlockShift + cls)) < Size) { ++cls; }
+        return cls;
+    }
+    static UINT64 ClassToSize(UINT Class) noexcept { return UINT64(1) << (c_MinBlockShift + Class); }
+    static UINT PageIndexOf(UINT64 TaggedOffset) noexcept { return UINT((TaggedOffset & ~c_TagBit) >> c_PageIndexShift); }
+
+    bool AddPage(ImmediateContext& Ctx) noexcept;
+    void Reclaim(ImmediateContext& Ctx) noexcept;
+    void PushFree(UINT Class, UINT64 TaggedOffset) noexcept;
+    D3D12ResourceSuballocation MakeSuballocation(UINT64 TaggedOffset, UINT Class) const noexcept;
+
+    std::mutex m_Lock;
+    std::unique_ptr<Page[]> m_Pages;  // c_MaxPages entries, allocated on first use
+    UINT m_NumPages = 0;
+    UINT64 m_CarveOffset = c_PageSize; // in-page carve cursor for page m_NumPages - 1
+    std::vector<UINT64> m_Free[c_NumClasses];
+
+    // Shared retired list, consumed from m_RetiredHead by Reclaim(). Guarded by m_Lock.
+    std::vector<RetiredBlock> m_Retired;
+    size_t m_RetiredHead = 0;
+
+    // Retirer-side staging. Guarded by m_StagingLock. The padding keeps it off m_Lock's cache line without
+    // over-aligning ImmediateContext (which may live in runtime-provided storage).
+    char m_CacheLinePad[64] = {};
+    std::mutex m_StagingLock;
+    std::vector<RetiredBlock> m_RetiredStaging;
+};
+
 struct PresentSurface
 {
     PresentSurface() : m_pResource(nullptr), m_subresource(0) {}
@@ -869,6 +973,7 @@ struct PresentCBArgs
 
 class ImmediateContext
 {
+    friend class DynamicCBSuballocationPool;
 public:
     // D3D12 objects
     // TODO: const
@@ -888,6 +993,9 @@ private:
     // Residency Manager needs to come after the deferred deletion queue so that defer deleted objects can
     // call EndTrackingObject on a valid residency manager
     ResidencyManager m_residencyManager;
+
+    // DX12Rim: dynamic CB slab pool. Declared before the deferred deletion queue so that it outlives it.
+    DynamicCBSuballocationPool m_DynamicCBPool;
 
     // It is important that the deferred deletion queue manager gets destroyed last, place solely strict dependencies above.
     COptLockedContainer<DeferredDeletionQueueManager> m_DeferredDeletionQueueManager;
@@ -1213,6 +1321,12 @@ public:
     Resource* TRANSLATION_API CreateRenameCookie(Resource* pResource, ResourceAllocationContext threadingContext);
     void TRANSLATION_API Rename(Resource* pResource, Resource* pRenameResource);
     void TRANSLATION_API RenameSuballocation(Resource* pResource, EncodedResourceSuballocation const& NewSuballocation);
+    // DX12Rim: fast dynamic-CB allocation for BatchedContext. Returns false when the caller must use CreateRenameCookie.
+    bool TRANSLATION_API TryAcquireDynamicCBSuballocation(UINT64 Size, D3D12ResourceSuballocation& Out) noexcept
+    {
+        return m_DynamicCBPool.m_bEnabled && m_DynamicCBPool.Allocate(*this, Size, Out);
+    }
+    void TRANSLATION_API SetDynamicCBPoolEnabled(bool bEnabled) noexcept { m_DynamicCBPool.m_bEnabled = bEnabled; }
     void TRANSLATION_API RenameViaCopy(Resource* pResource, Resource* pRenameResource, UINT DirtyPlaneMask);
     void TRANSLATION_API DeleteRenameCookie(Resource* pRenameResource);
 

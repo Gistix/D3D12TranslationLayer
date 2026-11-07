@@ -716,6 +716,7 @@ void BatchedContext::AddToBatch(BatchStorage& CurrentBatch, TCmd const& command)
     }
 
     Temp* pPtr = reinterpret_cast<Temp*>(CurrentBatch.append_contiguous_manually(sizeof(Temp) / sizeof(BatchPrimitive)));
+    PrefetchBatchWrite(pPtr);
     pPtr->CommandValue = TCmd::CmdValue;
     pPtr->Command = command;
 }
@@ -739,6 +740,7 @@ void BatchedContext::AddToBatchVariableSize(TCmd const& command, UINT NumEntries
     }
 
     Temp* pPtr = reinterpret_cast<Temp*>(m_CurrentBatch.append_contiguous_manually(TotalSizeInElements));
+    PrefetchBatchWrite(pPtr);
     pPtr->CommandValue = TCmd::CmdValue;
     pPtr->Command = command;
     std::copy(entries, entries + NumEntries, &pPtr->FirstEntry);
@@ -776,6 +778,7 @@ void BatchedContext::EmplaceInBatch(Args&&... args)
     }
 
     void* pPtr = m_CurrentBatch.append_contiguous_manually(CommandSize / sizeof(BatchPrimitive));
+    PrefetchBatchWrite(pPtr);
     new (pPtr) TCmd(std::forward<Args>(args)...);
 
     ++m_CurrentCommandCount;
@@ -1307,6 +1310,26 @@ void TRANSLATION_API BatchedContext::UnmapRenamedBuffer(BatchedResource* pResour
         memcpy(pResource->m_pCBLastCommitted, pResource->m_pCBWriteScratch, pResource->m_CBWidth);
         pResource->m_bHasCommittedCBData = true;
 
+        // DX12Rim fast path: take a fence-recycled block from the dynamic CB pool and queue a suballocation swap.
+        // No rename cookie Resource, no buddy allocator, no deferred deletion queue on either thread.
+        {
+            auto& ImmCtx = GetImmediateContextNoFlush();
+            D3D12ResourceSuballocation suballoc;
+            if (ImmCtx.TryAcquireDynamicCBSuballocation(pResource->m_CBAlignedSize, suballoc))
+            {
+                BYTE* pDst = suballoc.GetMappedCpuPtr();
+                assert(pDst != nullptr);
+                memcpy(pDst, pResource->m_pCBWriteScratch, pResource->m_CBWidth);
+                if (pResource->m_CBAlignedSize > pResource->m_CBWidth)
+                {
+                    memset(pDst + pResource->m_CBWidth, 0, pResource->m_CBAlignedSize - pResource->m_CBWidth);
+                }
+                pResource->m_LastRenamedResource = suballoc;
+                AddToBatch(CmdRenameSuballocation{ pResource->m_pResource, EncodedResourceSuballocation(suballoc) });
+                return;
+            }
+        }
+
         try
         {
             auto& ImmCtx = GetImmediateContextNoFlush();
@@ -1825,6 +1848,7 @@ void BatchedContext::ProcessBatchWork(BatchStorage& batch)
         const void* pCommandData = segmentIter->begin();
         while (pCommandData < segmentIter->end())
         {
+            PrefetchBatchRead(pCommandData);
             UINT const& CmdValue = *reinterpret_cast<UINT const*>(pCommandData);
             ASSUME(CmdValue <= c_LastCommand);
             m_DispatchTable[CmdValue](m_ImmCtx, pCommandData); // throws
