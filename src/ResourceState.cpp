@@ -1011,11 +1011,66 @@ namespace D3D12TranslationLayer
     }
 
     //----------------------------------------------------------------------------------------------------------------------------------
+    // DX12Rim: true when queueing pResource for a binding transition would be a no-op at the next PreDraw: it is
+    // exclusively owned by the graphics queue, has already been used (and had its state fence value updated) in the
+    // current graphics command list, and its current state already covers a read-only binding usage. Processing it
+    // would emit no barrier, leave its state unchanged, and UsedInCommandList would return early.
+    // If the command list is submitted before the next draw, ReassertResourceState re-queues all bound resources.
+    // Any other pending transition (copies, clears, etc.) queues the resource itself, and we don't skip pending ones.
+    bool ResourceStateManager::CanSkipBindingTransition(Resource* pResource) noexcept
+    {
+        static const bool s_bEnabled = []() noexcept
+        {
+            char Value[8] = {};
+            return !(GetEnvironmentVariableA("DX12RIM_BIND_FASTPATH", Value, ARRAYSIZE(Value)) > 0 && Value[0] == '0');
+        }();
+        if (!s_bEnabled || pResource->IsTransitionPending() || !pResource->GetIdentity() ||
+            !pResource->m_ResourceDeferredWaits.empty())
+        {
+            return false;
+        }
+
+        const UINT64 CurrentID = m_ImmCtx.GetCommandListID(COMMAND_LIST_TYPE::GRAPHICS);
+        if (pResource->m_LastUsedCommandListID[(UINT)COMMAND_LIST_TYPE::GRAPHICS] != CurrentID)
+        {
+            return false;
+        }
+
+        CCurrentResourceState const& Current = pResource->GetIdentity()->m_currentState;
+        if (Current.SupportsSimultaneousAccess() || !Current.AreAllSubresourcesSame() || !Current.IsExclusiveState(0))
+        {
+            return false;
+        }
+        auto const& Exclusive = Current.GetExclusiveSubresourceState(0);
+        if (Exclusive.CommandListType != COMMAND_LIST_TYPE::GRAPHICS || Exclusive.FenceValue != CurrentID)
+        {
+            return false;
+        }
+
+        auto& Bindings = pResource->GetBindingState();
+        if (!Bindings.AreAllSubresourcesTheSame())
+        {
+            return false;
+        }
+        const D3D12_RESOURCE_STATES Usage = Bindings.GetD3D12ResourceUsageFromBindings(0);
+        if (Usage == UNKNOWN_RESOURCE_STATE)
+        {
+            return true; // Nothing bound anymore: the queued transition would be skipped too.
+        }
+        return !IsD3D12WriteState(Usage, SubresourceTransitionFlags::None) &&
+            (Exclusive.State & Usage) == Usage;
+    }
+
+    //----------------------------------------------------------------------------------------------------------------------------------
     void ResourceStateManager::TransitionResourceForBindings(Resource* pResource) noexcept
     {
         if (pResource->GetIdentity() &&
             !pResource->GetIdentity()->m_bOwnsUnderlyingResource &&
             pResource->GetAllocatorHeapType() == AllocatorHeapType::Upload)
+        {
+            return;
+        }
+        if (CanSkipBindingTransition(pResource))
         {
             return;
         }
@@ -1039,6 +1094,10 @@ namespace D3D12TranslationLayer
         if (pResource->GetIdentity() &&
             !pResource->GetIdentity()->m_bOwnsUnderlyingResource &&
             pResource->GetAllocatorHeapType() == AllocatorHeapType::Upload)
+        {
+            return;
+        }
+        if (CanSkipBindingTransition(pResource))
         {
             return;
         }

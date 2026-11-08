@@ -4245,7 +4245,7 @@ bool ImmediateContext::ResourceAllocationFallback(ResourceAllocationContext thre
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------
-void ImmediateContext::ReturnAllBuffersToPool(Resource& UnderlyingResource) noexcept
+void ImmediateContext::ReturnAllBuffersToPool(Resource& UnderlyingResource, bool bImmediateThread) noexcept
 {
     if (!UnderlyingResource.m_Identity)
     {
@@ -4269,7 +4269,8 @@ void ImmediateContext::ReturnAllBuffersToPool(Resource& UnderlyingResource) noex
         {
             m_DynamicCBPool.Retire(
                 UnderlyingResource.m_Identity->m_suballocation.GetBufferSuballocation(),
-                UnderlyingResource.m_LastUsedCommandListID);
+                UnderlyingResource.m_LastUsedCommandListID,
+                bImmediateThread);
             UnderlyingResource.m_Identity->m_suballocation.Reset();
             return;
         }
@@ -4414,7 +4415,7 @@ void TRANSLATION_API ImmediateContext::RenameSuballocation(Resource* pResource, 
 
     const UINT64 curCmdListID = GetCommandListID(CmdListType);
     pResource->UsedInCommandList(CmdListType, curCmdListID);
-    ReturnAllBuffersToPool(*pResource);
+    ReturnAllBuffersToPool(*pResource, /*bImmediateThread*/ true);
 
     D3D12ResourceSuballocation suballoc = NewSuballocation.Decode();
     if (DynamicCBSuballocationPool::IsPoolBlock(suballoc.GetBufferSuballocation()))
@@ -5833,13 +5834,35 @@ bool DynamicCBSuballocationPool::Allocate(ImmediateContext& Ctx, UINT64 Size, D3
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------
-void DynamicCBSuballocationPool::Retire(HeapSuballocationBlock const& Block, const UINT64 LastCommandListIDs[(UINT)COMMAND_LIST_TYPE::MAX_VALID]) noexcept
+void DynamicCBSuballocationPool::Retire(HeapSuballocationBlock const& Block, const UINT64 LastCommandListIDs[(UINT)COMMAND_LIST_TYPE::MAX_VALID], bool bImmediateThread) noexcept
 {
     assert(IsPoolBlock(Block));
     assert((Block.GetOffset() & c_ClassMask) == 0);
     RetiredBlock retired;
     retired.TaggedOffsetAndClass = Block.GetOffset() | SizeToClass(Block.GetSize());
     std::copy(LastCommandListIDs, LastCommandListIDs + (UINT)COMMAND_LIST_TYPE::MAX_VALID, retired.LastCommandListIDs);
+
+    if (bImmediateThread)
+    {
+        // Hot path: one retirement per renamed CB on the batch thread. A lock here cost ~4% of that thread.
+        try
+        {
+            if (m_RetiredImmediate.capacity() == 0)
+            {
+                m_RetiredImmediate.reserve(c_RetireFlushThreshold * 4);
+            }
+            m_RetiredImmediate.push_back(retired);
+        }
+        catch (std::bad_alloc&)
+        {
+            return; // see below
+        }
+        if (m_RetiredImmediate.size() >= c_RetireFlushThreshold)
+        {
+            FlushImmediateRetired();
+        }
+        return;
+    }
 
     bool bFlush = false;
     {
@@ -5861,12 +5884,39 @@ void DynamicCBSuballocationPool::Retire(HeapSuballocationBlock const& Block, con
     }
     if (bFlush)
     {
-        FlushRetired();
+        FlushStagedRetired();
     }
 }
 
 //----------------------------------------------------------------------------------------------------------------------------------
 void DynamicCBSuballocationPool::FlushRetired() noexcept
+{
+    FlushImmediateRetired();
+    FlushStagedRetired();
+}
+
+//----------------------------------------------------------------------------------------------------------------------------------
+// ImmediateContext thread only.
+void DynamicCBSuballocationPool::FlushImmediateRetired() noexcept
+{
+    if (m_RetiredImmediate.empty())
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> Lock(m_Lock);
+    try
+    {
+        m_Retired.insert(m_Retired.end(), m_RetiredImmediate.begin(), m_RetiredImmediate.end());
+        m_RetiredImmediate.clear();
+    }
+    catch (std::bad_alloc&)
+    {
+        // Keep the staged blocks and try again on the next flush.
+    }
+}
+
+//----------------------------------------------------------------------------------------------------------------------------------
+void DynamicCBSuballocationPool::FlushStagedRetired() noexcept
 {
     std::lock_guard<std::mutex> StagingLock(m_StagingLock);
     if (m_RetiredStaging.empty())

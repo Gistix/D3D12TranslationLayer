@@ -890,10 +890,11 @@ public:
     // Recording thread. Returns false if the pool can't satisfy the request; callers fall back to the rename cookie path.
     bool Allocate(ImmediateContext& Ctx, UINT64 Size, D3D12ResourceSuballocation& Out) noexcept;
 
-    // Any thread. The block must satisfy IsPoolBlock().
-    void Retire(HeapSuballocationBlock const& Block, const UINT64 LastCommandListIDs[(UINT)COMMAND_LIST_TYPE::MAX_VALID]) noexcept;
+    // The block must satisfy IsPoolBlock(). bImmediateThread must be true only on the thread that drives the
+    // ImmediateContext (the batch thread when batching); it stages without taking a lock. Other threads pass false.
+    void Retire(HeapSuballocationBlock const& Block, const UINT64 LastCommandListIDs[(UINT)COMMAND_LIST_TYPE::MAX_VALID], bool bImmediateThread) noexcept;
 
-    // Any thread. Publishes staged retirements to the allocator. Called after each command list submission.
+    // ImmediateContext thread. Publishes staged retirements to the allocator. Called after each command list submission.
     void FlushRetired() noexcept;
 
     // Restores the CPU/GPU base pointers on a suballocation that went through EncodedResourceSuballocation.
@@ -930,6 +931,8 @@ private:
 
     bool AddPage(ImmediateContext& Ctx) noexcept;
     void Reclaim(ImmediateContext& Ctx) noexcept;
+    void FlushImmediateRetired() noexcept;
+    void FlushStagedRetired() noexcept;
     void PushFree(UINT Class, UINT64 TaggedOffset) noexcept;
     D3D12ResourceSuballocation MakeSuballocation(UINT64 TaggedOffset, UINT Class) const noexcept;
 
@@ -948,6 +951,9 @@ private:
     char m_CacheLinePad[64] = {};
     std::mutex m_StagingLock;
     std::vector<RetiredBlock> m_RetiredStaging;
+
+    // Staging for retirements on the ImmediateContext thread (renames). Owned by that thread, so no lock.
+    std::vector<RetiredBlock> m_RetiredImmediate;
 };
 
 struct PresentSurface
@@ -1112,7 +1118,8 @@ public:
     void ReleaseSuballocatedHeap(AllocatorHeapType HeapType, D3D12ResourceSuballocation &resource, UINT64 FenceValue, COMMAND_LIST_TYPE commandListType) noexcept;
     void ReleaseSuballocatedHeap(AllocatorHeapType HeapType, D3D12ResourceSuballocation &resource, const UINT64 FenceValues[]) noexcept;
 
-    void ReturnAllBuffersToPool( Resource& UnderlyingResource) noexcept;
+    // bImmediateThread: true when called on the ImmediateContext thread (renames); ~Resource may run elsewhere.
+    void ReturnAllBuffersToPool( Resource& UnderlyingResource, bool bImmediateThread = false) noexcept;
    
 
     static void UploadDataToMappedBuffer(_In_reads_bytes_(Placement.Depth * DepthPitch) const void* pData, UINT SrcPitch, UINT SrcDepth, 

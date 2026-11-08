@@ -466,5 +466,9 @@ constexpr D3D12_RESOURCE_STATES RESOURCE_STATE_ALL_WRITE_BITS =
         void ApplyAllResourceTransitions(bool bIsPreDraw = false) noexcept(false);
 
         using ResourceStateManagerBase::AddDeferredWait;
+
+    private:
+        // DX12Rim: skips queueing binding transitions that would be no-ops (see definition).
+        bool CanSkipBindingTransition(Resource* pResource) noexcept;
     };
 };
