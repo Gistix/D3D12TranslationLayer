@@ -5685,7 +5685,16 @@ bool DynamicCBSuballocationPool::AddPage(ImmediateContext& Ctx) noexcept
             m_Pages = std::make_unique<Page[]>(c_MaxPages);
         }
 
-        D3D12_HEAP_PROPERTIES HeapProps = Ctx.GetHeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+        // Experiment: UPLOAD heaps are write-combined, and draining WC stores dominated the CB update cost. With
+        // DX12RIM_CB_WRITEBACK=1 the pages are write-back system memory instead (GPU reads them snooped over PCIe).
+        static const bool s_bWriteBack = []() noexcept
+        {
+            char Value[8] = {};
+            return GetEnvironmentVariableA("DX12RIM_CB_WRITEBACK", Value, ARRAYSIZE(Value)) > 0 && Value[0] == '1';
+        }();
+        D3D12_HEAP_PROPERTIES HeapProps = s_bWriteBack
+            ? CD3DX12_HEAP_PROPERTIES(D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0)
+            : Ctx.GetHeapProperties(D3D12_HEAP_TYPE_UPLOAD);
         D3D12_RESOURCE_DESC Desc = CD3DX12_RESOURCE_DESC::Buffer(c_PageSize);
         unique_comptr<ID3D12Resource> spResource;
         if (FAILED(Ctx.m_pDevice12->CreateCommittedResource(
